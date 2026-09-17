@@ -1,0 +1,500 @@
+from __future__ import annotations
+
+import io
+import re
+import sqlite3
+import zipfile
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterable
+from xml.etree import ElementTree as ET
+
+from db import UPLOAD_DIR, fetch_all, fetch_one, log_event, transaction
+
+
+INTERVIEW_TYPES = ("科研面", "英语面", "专业面", "行为面")
+COUNT_COLUMNS = {
+    "科研面": "research_count",
+    "英语面": "english_count",
+    "专业面": "professional_count",
+    "行为面": "behavior_count",
+}
+DIMENSION_LABELS = {
+    "logic_score": "逻辑表达",
+    "completeness_score": "完整度",
+    "accuracy_score": "专业准确性",
+    "clarity_score": "表达清晰度",
+    "response_score": "临场反应",
+}
+
+
+def extract_text(file_name: str, data: bytes) -> tuple[str, str]:
+    suffix = Path(file_name).suffix.lower()
+    try:
+        if suffix in {".txt", ".md", ".csv"}:
+            return data.decode("utf-8", errors="ignore")[:30000], "success"
+        if suffix == ".docx":
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                xml = archive.read("word/document.xml")
+            root = ET.fromstring(xml)
+            text = "\n".join(node.text or "" for node in root.iter() if node.tag.endswith("}t"))
+            return text[:30000], "success"
+        if suffix == ".pdf":
+            return "", "metadata_only"
+    except (OSError, KeyError, zipfile.BadZipFile, ET.ParseError):
+        return "", "failed"
+    return "", "metadata_only"
+
+
+def save_material(
+    *,
+    session_id: int | None,
+    material_type: str,
+    file_name: str,
+    data: bytes,
+) -> int:
+    content_text, parse_status = extract_text(file_name, data)
+    safe_name = re.sub(r"[^\w.\-\u4e00-\u9fff]", "_", Path(file_name).name)
+    folder = UPLOAD_DIR / (str(session_id) if session_id else "library")
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f"{datetime.now():%Y%m%d%H%M%S%f}_{safe_name}"
+    target.write_bytes(data)
+    with transaction() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO materials(session_id, material_type, file_name, file_type, file_size, content_text, parse_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, material_type, file_name, Path(file_name).suffix.lower(), len(data), content_text, parse_status),
+        )
+        material_id = int(cursor.lastrowid)
+    log_event(
+        "material_upload_success",
+        session_id,
+        "配置页" if session_id else "面试题库",
+        {"material_type": material_type, "file_name": file_name, "file_size": len(data)},
+    )
+    return material_id
+
+
+def create_session(
+    selection: str,
+    user_major: str,
+    counts: dict[str, int],
+    extra_requirement: str,
+) -> int:
+    practice_mode = "全流程面试" if selection == "全流程面试" else "单项面试"
+    interview_type = None if practice_mode == "全流程面试" else selection
+    if practice_mode == "全流程面试":
+        counts = {kind: 1 for kind in INTERVIEW_TYPES}
+    started_at = datetime.now().isoformat(timespec="seconds")
+    with transaction() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO interview_sessions(
+                practice_mode, interview_type, user_major, research_count, english_count,
+                professional_count, behavior_count, extra_requirement, status, started_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?)
+            """,
+            (
+                practice_mode,
+                interview_type,
+                user_major.strip(),
+                counts.get("科研面", 0),
+                counts.get("英语面", 0),
+                counts.get("专业面", 0),
+                counts.get("行为面", 0),
+                extra_requirement.strip(),
+                started_at,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def _material_for_type(materials: list[sqlite3.Row], interview_type: str) -> sqlite3.Row | None:
+    by_type: dict[str, list[sqlite3.Row]] = {}
+    for material in materials:
+        by_type.setdefault(material["material_type"], []).append(material)
+    if by_type.get("院校面试真题"):
+        return by_type["院校面试真题"][0]
+    if interview_type == "专业面" and by_type.get("专业资料"):
+        return by_type["专业资料"][0]
+    if interview_type in {"科研面", "英语面", "行为面"} and by_type.get("简历"):
+        return by_type["简历"][0]
+    return None
+
+
+def _material_question(material: sqlite3.Row, interview_type: str, index: int) -> str:
+    source_text = (material["content_text"] or "").strip()
+    lines = [
+        re.sub(r"^[\d一二三四五六七八九十、.()（）\-\s]+", "", line).strip()
+        for line in source_text.splitlines()
+        if len(line.strip()) >= 8
+    ]
+    if material["material_type"] == "院校面试真题" and lines:
+        candidate = lines[index % len(lines)]
+        return candidate if candidate.endswith(("？", "?")) else f"结合院校往年考查方向，请回答：{candidate}"
+    keyword = lines[index % len(lines)][:36] if lines else Path(material["file_name"]).stem
+    templates = {
+        "科研面": f"结合你资料中提到的“{keyword}”，请说明研究动机、方法和你的具体贡献。",
+        "英语面": f'Please explain the experience related to "{keyword}" and what you learned from it.',
+        "专业面": f"结合专业资料中的“{keyword}”，请解释其核心概念、适用场景与一个具体例子。",
+        "行为面": f"围绕“{keyword}”，请讲述一次具体经历，并说明你的行动、结果与反思。",
+    }
+    return templates[interview_type]
+
+
+def generate_questions_from_materials(
+    conn: sqlite3.Connection,
+    session_id: int,
+    requested_types: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Unified MVP generation seam. Replace internals when connecting an LLM."""
+    materials = conn.execute(
+        """
+        SELECT * FROM materials
+        WHERE session_id = ? OR session_id IS NULL
+        ORDER BY CASE WHEN session_id = ? THEN 0 ELSE 1 END, uploaded_at DESC
+        """,
+        (session_id, session_id),
+    ).fetchall()
+    generated: list[dict[str, Any]] = []
+    type_indices: Counter[str] = Counter()
+    for interview_type in requested_types:
+        index = type_indices[interview_type]
+        type_indices[interview_type] += 1
+        material = _material_for_type(materials, interview_type)
+        if material:
+            generated.append(
+                {
+                    "interview_type": interview_type,
+                    "question_text": _material_question(material, interview_type, index),
+                    "source_scope": "user_material",
+                    "source_type": material["material_type"],
+                    "source_question_id": None,
+                    "source_material_id": material["material_id"],
+                }
+            )
+            continue
+        rows = conn.execute(
+            "SELECT * FROM questions WHERE interview_type = ? AND is_active = 1 ORDER BY RANDOM()",
+            (interview_type,),
+        ).fetchall()
+        if not rows:
+            raise ValueError(f"系统题库缺少 {interview_type} 题目")
+        row = rows[index % len(rows)]
+        generated.append(
+            {
+                "interview_type": interview_type,
+                "question_text": row["question_text"],
+                "source_scope": "system",
+                "source_type": "系统题库",
+                "source_question_id": row["question_id"],
+                "source_material_id": None,
+            }
+        )
+    return generated
+
+
+def generate_session_questions(session_id: int) -> list[sqlite3.Row]:
+    with transaction() as conn:
+        session = conn.execute("SELECT * FROM interview_sessions WHERE session_id = ?", (session_id,)).fetchone()
+        if not session:
+            raise ValueError("面试会话不存在")
+        existing = conn.execute(
+            "SELECT * FROM session_questions WHERE session_id = ? ORDER BY sequence_no", (session_id,)
+        ).fetchall()
+        if existing:
+            return existing
+        requested_types: list[str] = []
+        if session["practice_mode"] == "全流程面试":
+            requested_types = list(INTERVIEW_TYPES)
+        else:
+            interview_type = session["interview_type"]
+            count = max(1, int(session[COUNT_COLUMNS[interview_type]]))
+            requested_types = [interview_type] * count
+        questions = generate_questions_from_materials(conn, session_id, requested_types)
+        for sequence_no, question in enumerate(questions, start=1):
+            conn.execute(
+                """
+                INSERT INTO session_questions(
+                    session_id, sequence_no, interview_type, question_text, source_scope,
+                    source_type, source_question_id, source_material_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    sequence_no,
+                    question["interview_type"],
+                    question["question_text"],
+                    question["source_scope"],
+                    question["source_type"],
+                    question["source_question_id"],
+                    question["source_material_id"],
+                ),
+            )
+    rows = get_session_questions(session_id)
+    for row in rows:
+        log_event(
+            "ai_question_generated",
+            session_id,
+            "模拟面试",
+            {"question_id": row["session_question_id"], "question_type": row["interview_type"], "source_type": row["source_type"]},
+        )
+    return rows
+
+
+def get_session_questions(session_id: int) -> list[sqlite3.Row]:
+    return fetch_all(
+        "SELECT * FROM session_questions WHERE session_id = ? ORDER BY sequence_no", (session_id,)
+    )
+
+
+def evaluate_answer(answer_text: str, interview_type: str) -> dict[str, Any]:
+    text = answer_text.strip()
+    length = len(text)
+    structure_hits = sum(word in text for word in ("首先", "其次", "最后", "背景", "任务", "行动", "结果", "反思"))
+    evidence_hits = sum(word in text for word in ("例如", "比如", "%", "数据", "结果", "提升", "降低", "验证"))
+    logic = min(94, 55 + min(length // 12, 22) + structure_hits * 4)
+    completeness = min(94, 52 + min(length // 10, 28) + evidence_hits * 3)
+    accuracy = min(92, 58 + min(length // 15, 18) + evidence_hits * 3)
+    clarity = min(95, 58 + min(length // 13, 24) + structure_hits * 3)
+    response = min(92, 60 + min(length // 16, 22) + (4 if length >= 80 else 0))
+    if interview_type == "英语面" and re.search(r"[A-Za-z]{4,}", text):
+        clarity = min(95, clarity + 5)
+        accuracy = min(95, accuracy + 3)
+    scores = {
+        "logic_score": float(logic),
+        "completeness_score": float(completeness),
+        "accuracy_score": float(accuracy),
+        "clarity_score": float(clarity),
+        "response_score": float(response),
+    }
+    weak_key = min(scores, key=scores.get)
+    weak_dimension = DIMENSION_LABELS[weak_key]
+    overall = round(sum(scores.values()) / len(scores), 1)
+    suggestions = {
+        "逻辑表达": "先用一句话给出结论，再按背景、行动、结果分层展开，避免信息并列堆叠。",
+        "完整度": "补充关键背景、你的具体职责、可验证结果和复盘，形成完整闭环。",
+        "专业准确性": "增加专业概念、方法选择依据和验证过程，避免只描述过程。",
+        "表达清晰度": "缩短长句，减少模糊指代，用关键词标记回答的三个层次。",
+        "临场反应": "先确认问题重点，停顿一秒组织框架，再用结论先行的方式作答。",
+    }
+    diagnosis = (
+        f"回答已覆盖主要内容，当前最需要提升的是{weak_dimension}。"
+        if length >= 60
+        else f"回答偏简略，信息证据不足，主要薄弱维度为{weak_dimension}。"
+    )
+    return {
+        **scores,
+        "overall_score": overall,
+        "weak_dimension": weak_dimension,
+        "diagnosis": diagnosis,
+        "suggestion": suggestions[weak_dimension],
+        "reference_structure": "结论（1句）→ 背景/目标 → 你的关键行动 → 量化或可验证结果 → 反思与迁移。",
+    }
+
+
+def submit_answer(session_id: int, session_question_id: int, answer_text: str, duration: int = 0) -> dict[str, Any]:
+    question = fetch_one(
+        "SELECT * FROM session_questions WHERE session_question_id = ? AND session_id = ?",
+        (session_question_id, session_id),
+    )
+    if not question:
+        raise ValueError("题目不存在")
+    result = evaluate_answer(answer_text, question["interview_type"])
+    with transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO answers(
+                session_question_id, session_id, answer_text, answer_duration, overall_score,
+                logic_score, completeness_score, accuracy_score, clarity_score, response_score,
+                weak_dimension, diagnosis, suggestion, reference_structure
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_question_id) DO UPDATE SET
+                answer_text=excluded.answer_text, answer_duration=excluded.answer_duration,
+                overall_score=excluded.overall_score, logic_score=excluded.logic_score,
+                completeness_score=excluded.completeness_score, accuracy_score=excluded.accuracy_score,
+                clarity_score=excluded.clarity_score, response_score=excluded.response_score,
+                weak_dimension=excluded.weak_dimension, diagnosis=excluded.diagnosis,
+                suggestion=excluded.suggestion, reference_structure=excluded.reference_structure
+            """,
+            (
+                session_question_id,
+                session_id,
+                answer_text.strip(),
+                duration,
+                result["overall_score"],
+                result["logic_score"],
+                result["completeness_score"],
+                result["accuracy_score"],
+                result["clarity_score"],
+                result["response_score"],
+                result["weak_dimension"],
+                result["diagnosis"],
+                result["suggestion"],
+                result["reference_structure"],
+            ),
+        )
+    log_event("answer_submitted", session_id, "模拟面试", {"question_id": session_question_id, "score": result["overall_score"]})
+    return result
+
+
+def maybe_generate_followup(
+    session_id: int,
+    session_question_id: int,
+    answer_text: str,
+    evaluation: dict[str, Any],
+) -> int | None:
+    """Insert one rule-based follow-up immediately after a weak/short base answer."""
+    with transaction() as conn:
+        question = conn.execute(
+            "SELECT * FROM session_questions WHERE session_id=? AND session_question_id=?",
+            (session_id, session_question_id),
+        ).fetchone()
+        if not question or question["is_followup"]:
+            return None
+        existing = conn.execute(
+            "SELECT session_question_id FROM session_questions WHERE parent_session_question_id=?",
+            (session_question_id,),
+        ).fetchone()
+        needs_followup = len(answer_text.strip()) < 80 or float(evaluation["overall_score"]) < 68
+        if existing or not needs_followup:
+            return None
+        sequence_no = int(question["sequence_no"]) + 1
+        conn.execute(
+            "UPDATE session_questions SET sequence_no=sequence_no+1000 WHERE session_id=? AND sequence_no>=?",
+            (session_id, sequence_no),
+        )
+        conn.execute(
+            "UPDATE session_questions SET sequence_no=sequence_no-999 WHERE session_id=? AND sequence_no>=1000",
+            (session_id,),
+        )
+        prompts = {
+            "逻辑表达": "追问：请先用一句话概括你的结论，再按两个关键步骤展开。",
+            "完整度": "追问：你能补充当时的具体背景、你的行动和最终结果吗？",
+            "专业准确性": "追问：请补充你选择该方法的专业依据，以及如何验证它有效。",
+            "表达清晰度": "追问：请用三句话重新概括，分别说明目标、行动和结果。",
+            "临场反应": "追问：如果条件发生变化，你会如何调整方案？请说明判断依据。",
+        }
+        cursor = conn.execute(
+            """
+            INSERT INTO session_questions(
+                session_id, sequence_no, interview_type, question_text, source_scope, source_type,
+                source_question_id, source_material_id, parent_session_question_id, is_followup
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                session_id,
+                sequence_no,
+                question["interview_type"],
+                prompts[evaluation["weak_dimension"]],
+                question["source_scope"],
+                question["source_type"],
+                question["source_question_id"],
+                question["source_material_id"],
+                session_question_id,
+            ),
+        )
+        followup_id = int(cursor.lastrowid)
+    log_event(
+        "ai_followup_generated",
+        session_id,
+        "模拟面试",
+        {"question_id": followup_id, "parent_question_id": session_question_id, "weak_dimension": evaluation["weak_dimension"]},
+    )
+    return followup_id
+
+
+def finish_session(session_id: int) -> None:
+    session = fetch_one("SELECT started_at FROM interview_sessions WHERE session_id=?", (session_id,))
+    started_at = datetime.fromisoformat(session["started_at"]) if session and session["started_at"] else datetime.now()
+    finished_at = datetime.now()
+    duration = max(0, int((finished_at - started_at).total_seconds()))
+    with transaction() as conn:
+        conn.execute(
+            """
+            UPDATE interview_sessions
+            SET status='completed', finished_at=?, duration_seconds=?
+            WHERE session_id=?
+            """,
+            (finished_at.isoformat(timespec="seconds"), duration, session_id),
+        )
+    answered = fetch_one("SELECT COUNT(*) AS count FROM answers WHERE session_id=?", (session_id,))["count"]
+    log_event("interview_finished", session_id, "模拟面试", {"completed_question_count": answered})
+
+
+def get_report(session_id: int) -> dict[str, Any] | None:
+    session = fetch_one("SELECT * FROM interview_sessions WHERE session_id=?", (session_id,))
+    if not session:
+        return None
+    summary = fetch_one(
+        """
+        SELECT COUNT(DISTINCT sq.session_question_id) AS total_questions,
+               COUNT(DISTINCT a.answer_id) AS answered_questions,
+               ROUND(AVG(a.overall_score),1) AS overall_score,
+               ROUND(AVG(a.logic_score),1) AS logic_score,
+               ROUND(AVG(a.completeness_score),1) AS completeness_score,
+               ROUND(AVG(a.accuracy_score),1) AS accuracy_score,
+               ROUND(AVG(a.clarity_score),1) AS clarity_score,
+               ROUND(AVG(a.response_score),1) AS response_score
+        FROM session_questions sq
+        LEFT JOIN answers a ON a.session_question_id=sq.session_question_id
+        WHERE sq.session_id=?
+        """,
+        (session_id,),
+    )
+    details = fetch_all(
+        """
+        SELECT sq.*, a.answer_text, a.overall_score, a.weak_dimension, a.diagnosis,
+               a.suggestion, a.reference_structure
+        FROM session_questions sq
+        LEFT JOIN answers a ON a.session_question_id=sq.session_question_id
+        WHERE sq.session_id=? ORDER BY sq.sequence_no
+        """,
+        (session_id,),
+    )
+    weak_rows = fetch_all(
+        "SELECT weak_dimension, COUNT(*) AS count FROM answers WHERE session_id=? GROUP BY weak_dimension ORDER BY count DESC, weak_dimension",
+        (session_id,),
+    )
+    return {"session": session, "summary": summary, "details": details, "weaknesses": weak_rows}
+
+
+def list_sessions() -> list[sqlite3.Row]:
+    return fetch_all(
+        """
+        SELECT s.*, COUNT(DISTINCT sq.session_question_id) AS question_count,
+               COUNT(DISTINCT a.answer_id) AS answer_count, ROUND(AVG(a.overall_score),1) AS overall_score
+        FROM interview_sessions s
+        LEFT JOIN session_questions sq ON sq.session_id=s.session_id
+        LEFT JOIN answers a ON a.session_id=s.session_id
+        GROUP BY s.session_id ORDER BY s.created_at DESC
+        """
+    )
+
+
+def list_materials() -> list[sqlite3.Row]:
+    return fetch_all("SELECT * FROM materials ORDER BY uploaded_at DESC")
+
+
+def list_questions(interview_type: str | None = None) -> list[sqlite3.Row]:
+    if interview_type and interview_type != "全部":
+        return fetch_all("SELECT * FROM questions WHERE interview_type=? ORDER BY question_id", (interview_type,))
+    return fetch_all("SELECT * FROM questions ORDER BY interview_type, question_id")
+
+
+def dashboard_metrics() -> dict[str, Any]:
+    row = fetch_one(
+        """
+        SELECT (SELECT COUNT(*) FROM interview_sessions) AS sessions,
+               COALESCE((SELECT ROUND(AVG(overall_score),1) FROM answers),0) AS avg_score,
+               COALESCE((SELECT SUM(duration_seconds) FROM interview_sessions),0) AS total_seconds
+        """
+    )
+    return dict(row) if row else {"sessions": 0, "avg_score": 0, "total_seconds": 0}
+
+
+def recent_events(limit: int = 100) -> list[sqlite3.Row]:
+    return fetch_all("SELECT * FROM event_logs ORDER BY event_id DESC LIMIT ?", (limit,))
