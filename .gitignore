@@ -1,7 +1,8 @@
 __pycache__/
 .pytest_cache/
 .venv/
+.streamlit/secrets.toml
+.env
 data/yanyan.db
 data/uploads/*
 !data/uploads/.gitkeep
-

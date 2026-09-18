@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree as ET
 
+from ai_client import AIServiceError, analyze_interview_answer, generate_interview_question
 from db import UPLOAD_DIR, fetch_all, fetch_one, log_event, transaction
 
 
@@ -149,8 +150,10 @@ def generate_questions_from_materials(
     conn: sqlite3.Connection,
     session_id: int,
     requested_types: Iterable[str],
+    user_major: str = "",
+    extra_requirement: str = "",
 ) -> list[dict[str, Any]]:
-    """Unified MVP generation seam. Replace internals when connecting an LLM."""
+    """Generate material-based questions with DeepSeek and a deterministic fallback."""
     materials = conn.execute(
         """
         SELECT * FROM materials
@@ -166,14 +169,34 @@ def generate_questions_from_materials(
         type_indices[interview_type] += 1
         material = _material_for_type(materials, interview_type)
         if material:
+            generation_method = "rule"
+            try:
+                question_text = generate_interview_question(
+                    interview_type=interview_type,
+                    material_type=material["material_type"],
+                    material_name=material["file_name"],
+                    material_text=material["content_text"] or material["file_name"],
+                    user_major=user_major,
+                    extra_requirement=extra_requirement,
+                )
+                generation_method = "deepseek"
+            except AIServiceError as exc:
+                question_text = _material_question(material, interview_type, index)
+                log_event(
+                    "ai_fallback_used",
+                    session_id,
+                    "抽题服务",
+                    {"task": "question_generation", "reason": str(exc)[:200]},
+                )
             generated.append(
                 {
                     "interview_type": interview_type,
-                    "question_text": _material_question(material, interview_type, index),
+                    "question_text": question_text,
                     "source_scope": "user_material",
                     "source_type": material["material_type"],
                     "source_question_id": None,
                     "source_material_id": material["material_id"],
+                    "generation_method": generation_method,
                 }
             )
             continue
@@ -192,6 +215,7 @@ def generate_questions_from_materials(
                 "source_type": "系统题库",
                 "source_question_id": row["question_id"],
                 "source_material_id": None,
+                "generation_method": "system_bank",
             }
         )
     return generated
@@ -214,14 +238,20 @@ def generate_session_questions(session_id: int) -> list[sqlite3.Row]:
             interview_type = session["interview_type"]
             count = max(1, int(session[COUNT_COLUMNS[interview_type]]))
             requested_types = [interview_type] * count
-        questions = generate_questions_from_materials(conn, session_id, requested_types)
+        questions = generate_questions_from_materials(
+            conn,
+            session_id,
+            requested_types,
+            user_major=session["user_major"],
+            extra_requirement=session["extra_requirement"] or "",
+        )
         for sequence_no, question in enumerate(questions, start=1):
             conn.execute(
                 """
                 INSERT INTO session_questions(
                     session_id, sequence_no, interview_type, question_text, source_scope,
-                    source_type, source_question_id, source_material_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    source_type, source_question_id, source_material_id, generation_method
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -232,6 +262,7 @@ def generate_session_questions(session_id: int) -> list[sqlite3.Row]:
                     question["source_type"],
                     question["source_question_id"],
                     question["source_material_id"],
+                    question["generation_method"],
                 ),
             )
     rows = get_session_questions(session_id)
@@ -293,37 +324,71 @@ def evaluate_answer(answer_text: str, interview_type: str) -> dict[str, Any]:
         "diagnosis": diagnosis,
         "suggestion": suggestions[weak_dimension],
         "reference_structure": "结论（1句）→ 背景/目标 → 你的关键行动 → 量化或可验证结果 → 反思与迁移。",
+        "evaluation_method": "rule",
     }
 
 
 def submit_answer(session_id: int, session_question_id: int, answer_text: str, duration: int = 0) -> dict[str, Any]:
+    cleaned_answer = answer_text.strip()
     question = fetch_one(
         "SELECT * FROM session_questions WHERE session_question_id = ? AND session_id = ?",
         (session_question_id, session_id),
     )
     if not question:
         raise ValueError("题目不存在")
-    result = evaluate_answer(answer_text, question["interview_type"])
+    existing = fetch_one(
+        "SELECT * FROM answers WHERE session_id=? AND session_question_id=?",
+        (session_id, session_question_id),
+    )
+    if existing and existing["answer_text"] == cleaned_answer:
+        return {
+            "overall_score": existing["overall_score"],
+            "logic_score": existing["logic_score"],
+            "completeness_score": existing["completeness_score"],
+            "accuracy_score": existing["accuracy_score"],
+            "clarity_score": existing["clarity_score"],
+            "response_score": existing["response_score"],
+            "weak_dimension": existing["weak_dimension"],
+            "diagnosis": existing["diagnosis"],
+            "suggestion": existing["suggestion"],
+            "reference_structure": existing["reference_structure"],
+            "evaluation_method": existing["evaluation_method"],
+        }
+    try:
+        result = analyze_interview_answer(
+            question_text=question["question_text"],
+            answer_text=cleaned_answer,
+            interview_type=question["interview_type"],
+        )
+    except AIServiceError as exc:
+        result = evaluate_answer(answer_text, question["interview_type"])
+        log_event(
+            "ai_fallback_used",
+            session_id,
+            "评分服务",
+            {"task": "answer_evaluation", "question_id": session_question_id, "reason": str(exc)[:200]},
+        )
     with transaction() as conn:
         conn.execute(
             """
             INSERT INTO answers(
                 session_question_id, session_id, answer_text, answer_duration, overall_score,
                 logic_score, completeness_score, accuracy_score, clarity_score, response_score,
-                weak_dimension, diagnosis, suggestion, reference_structure
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                weak_dimension, diagnosis, suggestion, reference_structure, evaluation_method
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_question_id) DO UPDATE SET
                 answer_text=excluded.answer_text, answer_duration=excluded.answer_duration,
                 overall_score=excluded.overall_score, logic_score=excluded.logic_score,
                 completeness_score=excluded.completeness_score, accuracy_score=excluded.accuracy_score,
                 clarity_score=excluded.clarity_score, response_score=excluded.response_score,
                 weak_dimension=excluded.weak_dimension, diagnosis=excluded.diagnosis,
-                suggestion=excluded.suggestion, reference_structure=excluded.reference_structure
+                suggestion=excluded.suggestion, reference_structure=excluded.reference_structure,
+                evaluation_method=excluded.evaluation_method
             """,
             (
                 session_question_id,
                 session_id,
-                answer_text.strip(),
+                cleaned_answer,
                 duration,
                 result["overall_score"],
                 result["logic_score"],
@@ -335,6 +400,7 @@ def submit_answer(session_id: int, session_question_id: int, answer_text: str, d
                 result["diagnosis"],
                 result["suggestion"],
                 result["reference_structure"],
+                result["evaluation_method"],
             ),
         )
     log_event("answer_submitted", session_id, "模拟面试", {"question_id": session_question_id, "score": result["overall_score"]})
@@ -382,8 +448,8 @@ def maybe_generate_followup(
             """
             INSERT INTO session_questions(
                 session_id, sequence_no, interview_type, question_text, source_scope, source_type,
-                source_question_id, source_material_id, parent_session_question_id, is_followup
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                source_question_id, source_material_id, parent_session_question_id, generation_method, is_followup
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'rule_followup', 1)
             """,
             (
                 session_id,
@@ -448,7 +514,7 @@ def get_report(session_id: int) -> dict[str, Any] | None:
     details = fetch_all(
         """
         SELECT sq.*, a.answer_text, a.overall_score, a.weak_dimension, a.diagnosis,
-               a.suggestion, a.reference_structure
+               a.suggestion, a.reference_structure, a.evaluation_method
         FROM session_questions sq
         LEFT JOIN answers a ON a.session_question_id=sq.session_question_id
         WHERE sq.session_id=? ORDER BY sq.sequence_no

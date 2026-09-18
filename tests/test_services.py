@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import db
 import services
@@ -12,6 +13,7 @@ import services
 
 class YanyanMvpTests(unittest.TestCase):
     def setUp(self) -> None:
+        os.environ["AI_DISABLED"] = "1"
         self.temp_dir = tempfile.TemporaryDirectory()
         db.DATA_DIR = Path(self.temp_dir.name)
         db.UPLOAD_DIR = db.DATA_DIR / "uploads"
@@ -21,6 +23,7 @@ class YanyanMvpTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+        os.environ.pop("AI_DISABLED", None)
 
     def test_full_process_generates_exactly_four_types(self) -> None:
         session_id = services.create_session("全流程面试", "计算机", {}, "")
@@ -87,6 +90,50 @@ class YanyanMvpTests(unittest.TestCase):
             session_id, question["session_question_id"], "我做了一个项目。", evaluation
         )
         self.assertIsNone(second_attempt)
+
+    def test_deepseek_material_question_is_saved(self) -> None:
+        session_id = services.create_session("科研面", "人工智能", {"科研面": 1}, "关注实验设计")
+        services.save_material(
+            session_id=session_id,
+            material_type="简历",
+            file_name="简历.txt",
+            data="我负责医学影像分割项目的数据清洗与消融实验。".encode("utf-8"),
+        )
+        with patch.object(services, "generate_interview_question", return_value="你如何设计消融实验以验证各模块贡献？"):
+            rows = services.generate_session_questions(session_id)
+        self.assertEqual("deepseek", rows[0]["generation_method"])
+        self.assertIn("消融实验", rows[0]["question_text"])
+
+    def test_deepseek_answer_evaluation_is_saved(self) -> None:
+        session_id = services.create_session("科研面", "人工智能", {"科研面": 1}, "")
+        question = services.generate_session_questions(session_id)[0]
+        ai_result = {
+            "logic_score": 81.0,
+            "completeness_score": 78.0,
+            "accuracy_score": 84.0,
+            "clarity_score": 82.0,
+            "response_score": 79.0,
+            "overall_score": 80.8,
+            "weak_dimension": "完整度",
+            "diagnosis": "回答说明了实验过程，但没有交代你的个人职责边界。",
+            "suggestion": "补充你独立负责的步骤，并给出一个量化结果。",
+            "reference_structure": "研究目标、个人职责、关键行动、实验结果、复盘。",
+            "evaluation_method": "deepseek",
+        }
+        with patch.object(services, "analyze_interview_answer", return_value=ai_result):
+            result = services.submit_answer(session_id, question["session_question_id"], "我完成了实验。")
+        report = services.get_report(session_id)
+        self.assertEqual("deepseek", result["evaluation_method"])
+        self.assertEqual("deepseek", report["details"][0]["evaluation_method"])
+
+    def test_identical_answer_reuses_saved_evaluation(self) -> None:
+        session_id = services.create_session("科研面", "人工智能", {"科研面": 1}, "")
+        question = services.generate_session_questions(session_id)[0]
+        answer = "我负责数据处理，并通过消融实验验证不同模块的贡献。"
+        first = services.submit_answer(session_id, question["session_question_id"], answer)
+        with patch.object(services, "analyze_interview_answer", side_effect=AssertionError("不应重复调用 API")):
+            second = services.submit_answer(session_id, question["session_question_id"], answer)
+        self.assertEqual(first["overall_score"], second["overall_score"])
 
 
 if __name__ == "__main__":

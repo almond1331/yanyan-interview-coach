@@ -2,13 +2,14 @@
 
 一个使用 Python、Streamlit 和 SQLite 实现的保研面试文字陪练闭环：
 
-`面试大厅 → 三步配置 → 抽题/生成题 → 文字作答 → 规则评分 → 报告与训练计划 → 历史记录`
+`面试大厅 → 三步配置 → 抽题/生成题 → 文字作答 → AI 评分 → 报告与训练计划 → 历史记录`
 
 ## 项目结构
 
 ```text
 言言陪练-mvp/
 ├─ app.py                  # Streamlit 页面与交互流程
+├─ ai_client.py            # DeepSeek API、JSON 校验、超时和错误处理
 ├─ db.py                   # SQLite 连接、初始化、示例数据与埋点
 ├─ services.py             # 出题优先级、资料解析、评分、报告服务
 ├─ schema.sql              # 六张核心表、约束与索引
@@ -32,8 +33,13 @@ cd "C:\Users\温漫玉\Documents\Codex\2026-09-15\n-h\outputs\言言陪练-mvp"
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 py -m pip install -r requirements.txt
+Copy-Item .streamlit\secrets.toml.example .streamlit\secrets.toml
 py -m streamlit run app.py
 ```
+
+打开 `.streamlit/secrets.toml`，仅将 `DEEPSEEK_API_KEY` 替换为真实 Key。Base URL 必须写成纯文本网址，不能写成 Markdown 链接。`secrets.toml` 已被 `.gitignore` 忽略，禁止上传 GitHub。
+
+启动应用后，侧边栏应显示“DeepSeek 已配置”。点击“测试 AI 连接”可验证 Key、Base URL 和模型 ID；这会产生极少量 API 用量。
 
 浏览器打开终端显示的地址，通常是 `http://localhost:8501`。
 
@@ -66,7 +72,7 @@ python -m streamlit run app.py
 - 对过短或规则评分偏低的回答，MVP 会插入一条针对薄弱维度的追问；追问保留原题来源字段，且不会递归追问。
 - 专业面系统题库当前为会计学方向，非会计用户且未上传可用资料时会收到页面提示，但仍可继续体验。
 
-统一的资料出题入口是 `services.generate_questions_from_materials()`。目前使用本地关键词和模板生成；接入大模型时只需替换该函数内部实现，面试流程和表结构无需重写。
+统一的资料出题入口是 `services.generate_questions_from_materials()`。存在可用资料和 DeepSeek 配置时，系统使用 `deepseek-flash` 生成问题；API 未配置、超时、鉴权失败或 JSON 无效时自动使用本地规则。系统题库抽题不调用模型。
 
 ## 上传资料说明
 
@@ -75,9 +81,21 @@ python -m streamlit run app.py
 - “面试题库”页上传的资料作为全局资料，可供后续会话使用；配置流程上传的资料优先服务于当前会话。
 - 演示环境无登录体系，所有历史和全局资料均视为同一个本地用户的数据。
 
+## DeepSeek 配置
+
+本地配置文件 `.streamlit/secrets.toml`：
+
+```toml
+DEEPSEEK_API_KEY = "sk-真实密钥"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL = "deepseek-flash"
+```
+
+部署到 Streamlit Community Cloud 后，在应用 `Settings → Secrets` 中粘贴相同三项配置。不要将真实 Key 写入代码、README 或 GitHub。
+
 ## 评分说明
 
-第一版不调用外部 AI。评分依据回答长度、结构词、证据/结果词等可解释规则，生成五个维度分、薄弱项、诊断、建议和参考回答结构。它适合演示产品闭环，不代表真实院校录取评价。
+配置 DeepSeek 后，回答分析会生成五个维度分、薄弱项、具体诊断、修改建议和参考回答结构。模型输出经过 JSON 字段、分数范围和文本长度校验；失败时自动退回原规则评分。AI 反馈仅用于练习，不代表真实院校录取评价。
 
 ## 测试
 
@@ -85,7 +103,7 @@ python -m streamlit run app.py
 py -m unittest discover -s tests -v
 ```
 
-测试覆盖：全流程四类各一题、院校真题最高优先级、专业资料优先级、简历不覆盖专业面规则、规则追问，以及回答保存到报告生成的完整往返。
+测试覆盖：全流程四类各一题、院校真题最高优先级、专业资料优先级、简历不覆盖专业面规则、规则追问、DeepSeek 出题与评分入库，以及回答保存到报告生成的完整往返。测试默认关闭真实 API，不消耗余额。
 
 ## SQL 与 BI
 

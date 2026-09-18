@@ -74,6 +74,11 @@ def init_db() -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(session_questions)")}
         if "parent_session_question_id" not in columns:
             conn.execute("ALTER TABLE session_questions ADD COLUMN parent_session_question_id INTEGER")
+        if "generation_method" not in columns:
+            conn.execute("ALTER TABLE session_questions ADD COLUMN generation_method TEXT NOT NULL DEFAULT 'rule'")
+        answer_columns = {row[1] for row in conn.execute("PRAGMA table_info(answers)")}
+        if "evaluation_method" not in answer_columns:
+            conn.execute("ALTER TABLE answers ADD COLUMN evaluation_method TEXT NOT NULL DEFAULT 'rule'")
         count = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
         if count == 0:
             rows = [

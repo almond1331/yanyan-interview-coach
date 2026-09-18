@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS session_questions (
     source_question_id INTEGER,
     source_material_id INTEGER,
     parent_session_question_id INTEGER,
+    generation_method TEXT NOT NULL DEFAULT 'rule',
     is_followup INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (session_id, sequence_no),
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS answers (
     diagnosis TEXT NOT NULL,
     suggestion TEXT NOT NULL,
     reference_structure TEXT NOT NULL,
+    evaluation_method TEXT NOT NULL DEFAULT 'rule',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (session_question_id) REFERENCES session_questions(session_question_id) ON DELETE CASCADE,
     FOREIGN KEY (session_id) REFERENCES interview_sessions(session_id) ON DELETE CASCADE

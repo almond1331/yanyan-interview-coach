@@ -5,6 +5,7 @@ from datetime import datetime
 
 import streamlit as st
 
+from ai_client import AIServiceError, provider_status, test_connection
 from db import DB_PATH, init_db, log_event
 from services import (
     DIMENSION_LABELS,
@@ -116,6 +117,18 @@ def sidebar() -> str:
         st.session_state.sidebar_nav = target
     current = st.sidebar.radio("导航", options, key="sidebar_nav", label_visibility="collapsed")
     st.sidebar.caption("保研 AI 面试助手 · MVP")
+    ai_enabled, ai_message = provider_status()
+    if ai_enabled:
+        st.sidebar.success(ai_message)
+        if st.sidebar.button("测试 AI 连接", icon=":material/wifi_tethering:", use_container_width=True):
+            try:
+                with st.spinner("正在连接 DeepSeek……"):
+                    message = test_connection()
+                st.sidebar.success(message)
+            except AIServiceError as exc:
+                st.sidebar.error(str(exc))
+    else:
+        st.sidebar.info(ai_message)
     return current
 
 
@@ -147,6 +160,9 @@ def config_dialog() -> None:
     if step == 1:
         st.subheader("完善用户信息")
         st.caption("专业为必填；上传资料后，言言会按题型匹配最合适的来源。")
+        ai_enabled, _ = provider_status()
+        if ai_enabled:
+            st.info("AI 模式已开启：上传的资料片段和面试回答会发送给 DeepSeek 用于本轮出题与反馈。请勿上传身份证号等无关敏感信息。")
         major = st.text_input("目标专业 / 申请方向 *", key="config_major", placeholder="例如：计算机科学与技术")
         resume = st.file_uploader("个人简历（选填）", type=["pdf", "docx", "txt"], key="config_resume")
         material_type = st.segmented_control(
@@ -212,7 +228,8 @@ def config_dialog() -> None:
                 material_type = st.session_state.get("config_material_type", "专业资料")
                 for uploaded in st.session_state.get("config_materials") or []:
                     save_material(session_id=session_id, material_type=material_type, file_name=uploaded.name, data=uploaded.getvalue())
-                generate_session_questions(session_id)
+                with st.spinner("言言正在准备本轮问题……"):
+                    generate_session_questions(session_id)
                 log_event("config_complete", session_id, "配置页", {"major": major, "selection": mode})
                 log_event("interview_started", session_id, "模拟面试", {"selection": mode, "camera_on": camera})
                 st.session_state.active_session_id = session_id
@@ -269,7 +286,7 @@ def render_chat(questions: list, current_index: int) -> None:
     st.subheader("对话记录")
     for index, question in enumerate(questions[: current_index + 1]):
         st.markdown(
-            f'<div class="chat-ai"><b>言言 · 面试官</b><br>{html.escape(question["question_text"])}<br><span class="source-badge">{html.escape(question["source_type"])}</span></div>',
+            f'<div class="chat-ai"><b>言言 · 面试官</b><br>{html.escape(question["question_text"])}<br><span class="source-badge">{html.escape(question["source_type"])} · {html.escape(question["generation_method"])}</span></div>',
             unsafe_allow_html=True,
         )
         answer = get_report(question["session_id"])["details"][index]["answer_text"]
@@ -321,7 +338,8 @@ def render_interview(session_id: int) -> None:
         answer_text = st.session_state.get(answer_key, "").strip()
         with done_col:
             if st.button("答题完毕", type="primary", use_container_width=True, disabled=not answer_text):
-                evaluation = submit_answer(session_id, questions[index]["session_question_id"], answer_text)
+                with st.spinner("言言正在分析你的回答……"):
+                    evaluation = submit_answer(session_id, questions[index]["session_question_id"], answer_text)
                 followup_id = maybe_generate_followup(
                     session_id, questions[index]["session_question_id"], answer_text, evaluation
                 )
@@ -338,7 +356,8 @@ def render_interview(session_id: int) -> None:
         with end_col:
             if st.button("结束并查看报告", use_container_width=True, disabled=not answer_text and not get_report(session_id)["summary"]["answered_questions"]):
                 if answer_text:
-                    submit_answer(session_id, questions[index]["session_question_id"], answer_text)
+                    with st.spinner("正在完成最后一题分析……"):
+                        submit_answer(session_id, questions[index]["session_question_id"], answer_text)
                 log_event("end_interview_click", session_id, "模拟面试")
                 finish_session(session_id)
                 st.session_state.report_session_id = session_id
@@ -375,11 +394,13 @@ def render_report(session_id: int) -> None:
         label = f"第 {item['sequence_no']} 题 · {kind_label} · {item['overall_score'] or 0} 分"
         with st.expander(label):
             st.markdown(f"**题目**　{item['question_text']}")
-            st.caption(f"来源：{item['source_type']} / {item['source_scope']}")
+            st.caption(f"来源：{item['source_type']} / {item['source_scope']} · 出题：{item['generation_method']}")
             st.markdown(f"**你的回答**　{item['answer_text'] or '未作答'}")
             st.markdown(f"**问题诊断**　{item['diagnosis'] or '暂无'}")
             st.markdown(f"**修改建议**　{item['suggestion'] or '完成作答后生成'}")
             st.markdown(f"**参考回答结构**　{item['reference_structure'] or '完成作答后生成'}")
+            if item["evaluation_method"]:
+                st.caption(f"反馈方式：{item['evaluation_method']}")
     weaknesses = [row["weak_dimension"] for row in report["weaknesses"]] or ["回答完整度"]
     st.markdown(
         f'<div class="training-band"><h3 style="color:white">训练计划</h3><b>本轮总体表现</b><p>已完成 {summary["answered_questions"]} / {summary["total_questions"]} 题，综合评分 {summary["overall_score"] or 0}。</p><b>薄弱项</b><p>{"、".join(weaknesses[:3])}</p><b>总结</b><p>保持结论先行，并用具体行动和结果支撑判断。</p><b>下一轮训练建议</b><p>围绕“{weaknesses[0]}”完成一轮专项练习；每题回答后检查是否包含结论、证据和反思。</p></div>',
