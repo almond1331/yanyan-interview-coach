@@ -7,7 +7,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import db
 import services
@@ -227,6 +227,23 @@ class YanyanMvpTests(unittest.TestCase):
         sql, params = connection.execute("SELECT * FROM questions WHERE question_id=?", (7,))
         self.assertEqual("SELECT * FROM questions WHERE question_id=%s", sql)
         self.assertEqual((7,), params)
+
+    def test_postgres_executemany_uses_cursor(self) -> None:
+        raw_connection = MagicMock()
+        cursor = raw_connection.cursor.return_value.__enter__.return_value
+        connection = db.DatabaseConnection(raw_connection, "postgres")
+        rows = [("科研面", "测试问题")]
+
+        connection.executemany(
+            "INSERT INTO questions(interview_type, question_text) VALUES (?, ?)",
+            rows,
+        )
+
+        cursor.executemany.assert_called_once_with(
+            "INSERT INTO questions(interview_type, question_text) VALUES (%s, %s)",
+            rows,
+        )
+        raw_connection.executemany.assert_not_called()
 
     def test_transaction_pooler_connection_disables_prepared_statements(self) -> None:
         settings = {

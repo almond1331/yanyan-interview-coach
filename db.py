@@ -124,6 +124,10 @@ class DatabaseConnection:
         return self.raw.execute(self._sql(sql), params)
 
     def executemany(self, sql: str, params: list[tuple[Any, ...]]) -> Any:
+        if self.backend == "postgres":
+            with self.raw.cursor() as cursor:
+                cursor.executemany(self._sql(sql), params)
+            return None
         return self.raw.executemany(self._sql(sql), params)
 
     def executescript(self, script: str) -> None:
