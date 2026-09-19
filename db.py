@@ -71,6 +71,12 @@ def transaction() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     with transaction() as conn:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        for table_name in ("interview_sessions", "materials", "event_logs"):
+            table_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+            if "visitor_id" not in table_columns:
+                conn.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN visitor_id TEXT NOT NULL DEFAULT 'legacy'"
+                )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(session_questions)")}
         if "parent_session_question_id" not in columns:
             conn.execute("ALTER TABLE session_questions ADD COLUMN parent_session_question_id INTEGER")
@@ -79,6 +85,17 @@ def init_db() -> None:
         answer_columns = {row[1] for row in conn.execute("PRAGMA table_info(answers)")}
         if "evaluation_method" not in answer_columns:
             conn.execute("ALTER TABLE answers ADD COLUMN evaluation_method TEXT NOT NULL DEFAULT 'rule'")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_visitor_created "
+            "ON interview_sessions(visitor_id, created_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_materials_visitor ON materials(visitor_id, uploaded_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_visitor_time "
+            "ON event_logs(visitor_id, created_at DESC)"
+        )
         count = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
         if count == 0:
             rows = [
@@ -110,12 +127,23 @@ def fetch_one(sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
 
 def log_event(
     event_name: str,
+    visitor_id: str,
     session_id: int | None = None,
     page_name: str | None = None,
     params: dict[str, Any] | None = None,
 ) -> None:
     with transaction() as conn:
+        if session_id is not None:
+            owner = conn.execute(
+                "SELECT visitor_id FROM interview_sessions WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            if not owner or owner["visitor_id"] != visitor_id:
+                raise ValueError("不能为其他访客的会话记录事件")
         conn.execute(
-            "INSERT INTO event_logs(session_id, event_name, page_name, event_params) VALUES (?, ?, ?, ?)",
-            (session_id, event_name, page_name, json.dumps(params or {}, ensure_ascii=False)),
+            """
+            INSERT INTO event_logs(session_id, visitor_id, event_name, page_name, event_params)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (session_id, visitor_id, event_name, page_name, json.dumps(params or {}, ensure_ascii=False)),
         )

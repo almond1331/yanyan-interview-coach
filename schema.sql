@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS questions (
 
 CREATE TABLE IF NOT EXISTS interview_sessions (
     session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    visitor_id TEXT NOT NULL DEFAULT 'legacy',
     practice_mode TEXT NOT NULL CHECK (practice_mode IN ('全流程面试','单项面试')),
     interview_type TEXT CHECK (interview_type IN ('科研面','英语面','专业面','行为面')),
     user_major TEXT NOT NULL,
@@ -30,6 +31,7 @@ CREATE TABLE IF NOT EXISTS interview_sessions (
 CREATE TABLE IF NOT EXISTS materials (
     material_id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER,
+    visitor_id TEXT NOT NULL DEFAULT 'legacy',
     material_type TEXT NOT NULL CHECK (material_type IN ('简历','专业资料','院校面试真题','其他资料')),
     file_name TEXT NOT NULL,
     file_type TEXT,
@@ -86,6 +88,7 @@ CREATE TABLE IF NOT EXISTS answers (
 CREATE TABLE IF NOT EXISTS event_logs (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER,
+    visitor_id TEXT NOT NULL DEFAULT 'legacy',
     event_name TEXT NOT NULL,
     page_name TEXT,
     event_params TEXT NOT NULL DEFAULT '{}',

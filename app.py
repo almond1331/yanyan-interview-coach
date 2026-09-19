@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import html
+import os
+import re
+import uuid
 from datetime import datetime
 
 import streamlit as st
 
 from ai_client import AIServiceError, provider_status, test_connection
-from db import DB_PATH, init_db, log_event
+from db import init_db, log_event
 from services import (
     DIMENSION_LABELS,
     INTERVIEW_TYPES,
+    MAX_ANSWER_CHARS,
+    MAX_UPLOAD_BYTES,
+    UsageLimitError,
+    clear_visitor_data,
     create_session,
     dashboard_metrics,
     finish_session,
@@ -20,7 +27,6 @@ from services import (
     list_questions,
     list_sessions,
     maybe_generate_followup,
-    recent_events,
     save_material,
     submit_answer,
 )
@@ -101,17 +107,37 @@ def init_state() -> None:
 init_state()
 
 
+def init_visitor_identity() -> str:
+    raw_token = str(st.query_params.get("visitor", ""))
+    existing_token = str(st.session_state.get("visitor_id", ""))
+    if re.fullmatch(r"[a-f0-9]{32}", raw_token):
+        token = raw_token
+    elif re.fullmatch(r"[a-f0-9]{32}", existing_token):
+        token = existing_token
+    else:
+        token = uuid.uuid4().hex
+    st.session_state.visitor_id = token
+    if raw_token != token:
+        st.query_params["visitor"] = token
+    return token
+
+
+VISITOR_ID = init_visitor_identity()
+
+
 def log_page_once(page: str, event: str) -> None:
     session_marker = st.session_state.get("active_session_id") or st.session_state.get("report_session_id")
     marker = f"{page}:{session_marker}"
     if st.session_state.get("last_page_marker") != marker:
-        log_event(event, st.session_state.get("active_session_id"), page)
+        log_event(event, VISITOR_ID, st.session_state.get("active_session_id"), page)
         st.session_state.last_page_marker = marker
 
 
 def sidebar() -> str:
     st.sidebar.markdown('<div class="brand"><span class="brandmark">言</span>言言陪练</div>', unsafe_allow_html=True)
-    options = ["面试大厅", "面试记录", "面试题库", "数据看板"]
+    options = ["面试大厅", "面试记录", "面试题库"]
+    if st.session_state.get("sidebar_nav") not in {None, *options}:
+        st.session_state.sidebar_nav = options[0]
     target = st.session_state.pop("nav_target", None)
     if target in options:
         st.session_state.sidebar_nav = target
@@ -120,7 +146,10 @@ def sidebar() -> str:
     ai_enabled, ai_message = provider_status()
     if ai_enabled:
         st.sidebar.success(ai_message)
-        if st.sidebar.button("测试 AI 连接", icon=":material/wifi_tethering:", use_container_width=True):
+        app_env = str(st.secrets.get("APP_ENV", os.getenv("APP_ENV", "production"))).lower()
+        if app_env == "development" and st.sidebar.button(
+            "测试 AI 连接", icon=":material/wifi_tethering:", use_container_width=True
+        ):
             try:
                 with st.spinner("正在连接 DeepSeek……"):
                     message = test_connection()
@@ -129,6 +158,17 @@ def sidebar() -> str:
                 st.sidebar.error(str(exc))
     else:
         st.sidebar.info(ai_message)
+    st.sidebar.caption("匿名体验：历史仅属于当前浏览器链接，请勿分享带 visitor 参数的完整网址。")
+    with st.sidebar.expander("隐私与数据"):
+        st.caption("资料文本和回答会发送给 DeepSeek 用于出题与反馈。请勿上传身份证、电话等敏感信息。")
+        confirm_clear = st.checkbox("我确认清除当前匿名访客的全部数据", key="confirm_clear_data")
+        if st.button("清除我的数据", disabled=not confirm_clear, use_container_width=True):
+            clear_visitor_data(VISITOR_ID)
+            for key in ("active_session_id", "report_session_id", "show_config"):
+                st.session_state[key] = None if key != "show_config" else False
+            st.session_state.confirm_clear_data = False
+            st.success("当前匿名访客的数据已清除。")
+            st.rerun()
     return current
 
 
@@ -136,9 +176,9 @@ def start_config(mode: str) -> None:
     st.session_state.selected_mode = mode
     st.session_state.show_config = True
     st.session_state.config_step = 1
-    log_event("interview_type_click", page_name="面试大厅", params={"selection": mode})
-    log_event("start_interview_click", page_name="面试大厅", params={"selection": mode})
-    log_event("config_modal_open", page_name="配置页", params={"selection": mode})
+    log_event("interview_type_click", VISITOR_ID, page_name="面试大厅", params={"selection": mode})
+    log_event("start_interview_click", VISITOR_ID, page_name="面试大厅", params={"selection": mode})
+    log_event("config_modal_open", VISITOR_ID, page_name="配置页", params={"selection": mode})
 
 
 def defaults_for_mode(mode: str) -> dict[str, int]:
@@ -163,13 +203,18 @@ def config_dialog() -> None:
         ai_enabled, _ = provider_status()
         if ai_enabled:
             st.info("AI 模式已开启：上传的资料片段和面试回答会发送给 DeepSeek 用于本轮出题与反馈。请勿上传身份证号等无关敏感信息。")
-        major = st.text_input("目标专业 / 申请方向 *", key="config_major", placeholder="例如：计算机科学与技术")
-        resume = st.file_uploader("个人简历（选填）", type=["pdf", "docx", "txt"], key="config_resume")
+        major = st.text_input(
+            "目标专业 / 申请方向 *", key="config_major", max_chars=80, placeholder="例如：计算机科学与技术"
+        )
+        resume = st.file_uploader("个人简历（选填，最大 5MB）", type=["pdf", "docx", "txt"], key="config_resume")
         material_type = st.segmented_control(
             "练习资料类型", ["院校面试真题", "专业资料", "其他资料"], default="专业资料", key="config_material_type"
         )
         practice_files = st.file_uploader(
-            "练习资料（选填，可多选）", type=["pdf", "docx", "txt", "md"], accept_multiple_files=True, key="config_materials"
+            "练习资料（选填，可多选，单个最大 5MB）",
+            type=["pdf", "docx", "txt", "md"],
+            accept_multiple_files=True,
+            key="config_materials",
         )
         _, right = st.columns([3, 1])
         with right:
@@ -188,9 +233,14 @@ def config_dialog() -> None:
                 column.metric(kind, "1 题")
         else:
             default_count = defaults_for_mode(mode)[mode]
-            count = st.number_input(f"{mode}题目数量", min_value=1, max_value=10, value=default_count, step=1)
+            count = st.number_input(f"{mode}题目数量", min_value=1, max_value=5, value=default_count, step=1)
             st.session_state.config_counts = {kind: (int(count) if kind == mode else 0) for kind in INTERVIEW_TYPES}
-        st.text_area("其他要求（选填）", key="config_extra", placeholder="例如：多追问科研经历，回答后给出更严格的结构反馈")
+        st.text_area(
+            "其他要求（选填）",
+            key="config_extra",
+            max_chars=500,
+            placeholder="例如：多追问科研经历，回答后给出更严格的结构反馈",
+        )
         left, _, right = st.columns([1, 2, 1])
         with left:
             if st.button("上一步", use_container_width=True):
@@ -221,23 +271,52 @@ def config_dialog() -> None:
         with right:
             if st.button("开始面试", type="primary", use_container_width=True, icon=":material/play_arrow:"):
                 counts = st.session_state.get("config_counts", defaults_for_mode(mode))
-                session_id = create_session(mode, major, counts, st.session_state.get("config_extra", ""))
                 resume = st.session_state.get("config_resume")
-                if resume:
-                    save_material(session_id=session_id, material_type="简历", file_name=resume.name, data=resume.getvalue())
                 material_type = st.session_state.get("config_material_type", "专业资料")
-                for uploaded in st.session_state.get("config_materials") or []:
-                    save_material(session_id=session_id, material_type=material_type, file_name=uploaded.name, data=uploaded.getvalue())
-                with st.spinner("言言正在准备本轮问题……"):
-                    generate_session_questions(session_id)
-                log_event("config_complete", session_id, "配置页", {"major": major, "selection": mode})
-                log_event("interview_started", session_id, "模拟面试", {"selection": mode, "camera_on": camera})
-                st.session_state.active_session_id = session_id
-                st.session_state.current_question_index = 0
-                st.session_state.show_dialog = False
-                st.session_state.camera_on = camera
-                st.session_state.show_config = False
-                st.rerun()
+                uploads = ([resume] if resume else []) + list(st.session_state.get("config_materials") or [])
+                if any(uploaded.size > MAX_UPLOAD_BYTES for uploaded in uploads):
+                    st.error("单个文件不能超过 5MB，请压缩后重试。")
+                else:
+                    try:
+                        session_id = create_session(
+                            VISITOR_ID, mode, major, counts, st.session_state.get("config_extra", "")
+                        )
+                        if resume:
+                            save_material(
+                                visitor_id=VISITOR_ID,
+                                session_id=session_id,
+                                material_type="简历",
+                                file_name=resume.name,
+                                data=resume.getvalue(),
+                            )
+                        for uploaded in st.session_state.get("config_materials") or []:
+                            save_material(
+                                visitor_id=VISITOR_ID,
+                                session_id=session_id,
+                                material_type=material_type,
+                                file_name=uploaded.name,
+                                data=uploaded.getvalue(),
+                            )
+                        with st.spinner("言言正在准备本轮问题……"):
+                            generate_session_questions(session_id, VISITOR_ID)
+                        log_event(
+                            "config_complete", VISITOR_ID, session_id, "配置页", {"major": major, "selection": mode}
+                        )
+                        log_event(
+                            "interview_started",
+                            VISITOR_ID,
+                            session_id,
+                            "模拟面试",
+                            {"selection": mode, "camera_on": camera},
+                        )
+                        st.session_state.active_session_id = session_id
+                        st.session_state.current_question_index = 0
+                        st.session_state.show_dialog = False
+                        st.session_state.camera_on = camera
+                        st.session_state.show_config = False
+                        st.rerun()
+                    except (UsageLimitError, ValueError) as exc:
+                        st.error(str(exc))
 
 
 def render_home() -> None:
@@ -263,7 +342,8 @@ def render_home() -> None:
                 start_config(name)
                 st.rerun()
     st.divider()
-    metrics = dashboard_metrics()
+    st.info("公开体验采用匿名链接隔离数据。上传资料和回答会用于 AI 分析，请勿填写身份证、电话等敏感信息。")
+    metrics = dashboard_metrics(VISITOR_ID)
     c1, c2, c3 = st.columns(3)
     c1.metric("累计模拟", f"{metrics['sessions']} 次")
     c2.metric("历史平均分", f"{metrics['avg_score']} 分")
@@ -271,7 +351,7 @@ def render_home() -> None:
 
 
 def elapsed_label(session_id: int) -> str:
-    report = get_report(session_id)
+    report = get_report(session_id, VISITOR_ID)
     started = report["session"]["started_at"] if report else None
     if not started:
         return "00:00"
@@ -289,13 +369,13 @@ def render_chat(questions: list, current_index: int) -> None:
             f'<div class="chat-ai"><b>言言 · 面试官</b><br>{html.escape(question["question_text"])}<br><span class="source-badge">{html.escape(question["source_type"])} · {html.escape(question["generation_method"])}</span></div>',
             unsafe_allow_html=True,
         )
-        answer = get_report(question["session_id"])["details"][index]["answer_text"]
+        answer = get_report(question["session_id"], VISITOR_ID)["details"][index]["answer_text"]
         if answer:
             st.markdown(f'<div class="chat-user">{html.escape(answer)}</div>', unsafe_allow_html=True)
 
 
 def render_interview(session_id: int) -> None:
-    questions = get_session_questions(session_id)
+    questions = get_session_questions(session_id, VISITOR_ID)
     index = min(st.session_state.current_question_index, max(0, len(questions) - 1))
     st.markdown(f'<div class="recording"><span class="dot"></span>录制中　{elapsed_label(session_id)}</div>', unsafe_allow_html=True)
     top_left, top_right = st.columns([1, 5])
@@ -318,32 +398,46 @@ def render_interview(session_id: int) -> None:
             unsafe_allow_html=True,
         )
         answer_key = f"answer_{session_id}_{questions[index]['session_question_id']}"
-        st.text_area("输入你的回答", key=answer_key, height=150, placeholder="完成思考后，在这里输入文字回答……")
+        st.text_area(
+            "输入你的回答",
+            key=answer_key,
+            height=150,
+            max_chars=MAX_ANSWER_CHARS,
+            placeholder="完成思考后，在这里输入文字回答……",
+        )
         mic_col, camera_col, dialog_col, done_col, end_col = st.columns([.65, .65, .65, 1.2, 1.7])
         with mic_col:
             if st.button("麦克风", icon=":material/mic:" if st.session_state.mic_on else ":material/mic_off:", use_container_width=True):
                 st.session_state.mic_on = not st.session_state.mic_on
-                log_event("mic_click", session_id, "模拟面试", {"enabled": st.session_state.mic_on})
+                log_event("mic_click", VISITOR_ID, session_id, "模拟面试", {"enabled": st.session_state.mic_on})
                 st.rerun()
         with camera_col:
             if st.button("摄像头", icon=":material/videocam:" if st.session_state.camera_on else ":material/videocam_off:", use_container_width=True):
                 st.session_state.camera_on = not st.session_state.camera_on
-                log_event("camera_click", session_id, "模拟面试", {"enabled": st.session_state.camera_on})
+                log_event("camera_click", VISITOR_ID, session_id, "模拟面试", {"enabled": st.session_state.camera_on})
                 st.rerun()
         with dialog_col:
             if st.button("对话", icon=":material/chat_bubble:", use_container_width=True):
                 st.session_state.show_dialog = not st.session_state.show_dialog
-                log_event("dialog_open", session_id, "模拟面试")
+                log_event("dialog_open", VISITOR_ID, session_id, "模拟面试")
                 st.rerun()
         answer_text = st.session_state.get(answer_key, "").strip()
         with done_col:
             if st.button("答题完毕", type="primary", use_container_width=True, disabled=not answer_text):
                 with st.spinner("言言正在分析你的回答……"):
-                    evaluation = submit_answer(session_id, questions[index]["session_question_id"], answer_text)
+                    evaluation = submit_answer(
+                        session_id, questions[index]["session_question_id"], answer_text, VISITOR_ID
+                    )
                 followup_id = maybe_generate_followup(
-                    session_id, questions[index]["session_question_id"], answer_text, evaluation
+                    session_id, questions[index]["session_question_id"], answer_text, evaluation, VISITOR_ID
                 )
-                log_event("answer_complete_click", session_id, "模拟面试", {"question_id": questions[index]["session_question_id"]})
+                log_event(
+                    "answer_complete_click",
+                    VISITOR_ID,
+                    session_id,
+                    "模拟面试",
+                    {"question_id": questions[index]["session_question_id"]},
+                )
                 if followup_id:
                     st.session_state.current_question_index = index + 1
                     st.toast("已记录回答，言言生成了一条针对性追问")
@@ -354,12 +448,17 @@ def render_interview(session_id: int) -> None:
                     st.toast("本轮题目已全部完成")
                 st.rerun()
         with end_col:
-            if st.button("结束并查看报告", use_container_width=True, disabled=not answer_text and not get_report(session_id)["summary"]["answered_questions"]):
+            report = get_report(session_id, VISITOR_ID)
+            if st.button(
+                "结束并查看报告",
+                use_container_width=True,
+                disabled=not answer_text and not report["summary"]["answered_questions"],
+            ):
                 if answer_text:
                     with st.spinner("正在完成最后一题分析……"):
-                        submit_answer(session_id, questions[index]["session_question_id"], answer_text)
-                log_event("end_interview_click", session_id, "模拟面试")
-                finish_session(session_id)
+                        submit_answer(session_id, questions[index]["session_question_id"], answer_text, VISITOR_ID)
+                log_event("end_interview_click", VISITOR_ID, session_id, "模拟面试")
+                finish_session(session_id, VISITOR_ID)
                 st.session_state.report_session_id = session_id
                 st.session_state.active_session_id = None
                 st.rerun()
@@ -367,7 +466,7 @@ def render_interview(session_id: int) -> None:
 
 
 def render_report(session_id: int) -> None:
-    report = get_report(session_id)
+    report = get_report(session_id, VISITOR_ID)
     if not report:
         st.error("未找到该场面试。")
         return
@@ -413,7 +512,7 @@ def render_report(session_id: int) -> None:
         st.session_state.nav_target = "面试大厅"
         st.rerun()
     if right.button("再练一轮", type="primary", icon=":material/replay:"):
-        log_event("next_practice_click", session_id, "面试报告", {"weak_dimension": weaknesses[0]})
+        log_event("next_practice_click", VISITOR_ID, session_id, "面试报告", {"weak_dimension": weaknesses[0]})
         start_config(title if title in INTERVIEW_TYPES else "全流程面试")
         st.session_state.report_session_id = None
         st.rerun()
@@ -424,7 +523,7 @@ def render_history() -> None:
     st.markdown('<div class="eyebrow">训练成长档案</div>', unsafe_allow_html=True)
     st.title("面试记录")
     st.caption("查看每一次模拟的表现，找到下一轮最值得投入的提升点。")
-    sessions = list_sessions()
+    sessions = list_sessions(VISITOR_ID)
     if not sessions:
         st.info("还没有面试记录，从面试大厅开始第一轮练习。")
         return
@@ -450,17 +549,23 @@ def render_library() -> None:
         st.subheader("上传题目或资料")
         c1, c2 = st.columns([1, 2])
         material_type = c1.selectbox("资料类型", ["院校面试真题", "专业资料", "简历", "其他资料"], key="library_type")
-        uploaded = c2.file_uploader("支持 PDF、DOCX、TXT、MD，单个文件不超过 20MB", type=["pdf", "docx", "txt", "md"], key="library_upload")
+        uploaded = c2.file_uploader("支持 PDF、DOCX、TXT、MD，单个文件不超过 5MB", type=["pdf", "docx", "txt", "md"], key="library_upload")
         if st.button("上传面试资料", type="primary", icon=":material/upload:", disabled=uploaded is None):
-            if uploaded.size > 20 * 1024 * 1024:
-                st.error("文件超过 20MB。")
+            if uploaded.size > MAX_UPLOAD_BYTES:
+                st.error("文件超过 5MB。")
             else:
-                save_material(session_id=None, material_type=material_type, file_name=uploaded.name, data=uploaded.getvalue())
+                save_material(
+                    visitor_id=VISITOR_ID,
+                    session_id=None,
+                    material_type=material_type,
+                    file_name=uploaded.name,
+                    data=uploaded.getvalue(),
+                )
                 st.success("资料已上传，可用于后续抽题。")
                 st.rerun()
     tab_materials, tab_questions = st.tabs(["已上传资料", "系统题库"])
     with tab_materials:
-        materials = list_materials()
+        materials = list_materials(VISITOR_ID)
         if not materials:
             st.info("暂无上传资料。")
         for item in materials:
@@ -478,27 +583,6 @@ def render_library() -> None:
             st.markdown(f"- **{item['interview_type']}** · {item['question_text']}  `{item['major_scope']}`")
 
 
-def render_dashboard() -> None:
-    st.markdown('<div class="eyebrow">基础数据</div>', unsafe_allow_html=True)
-    st.title("数据看板")
-    metrics = dashboard_metrics()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("面试会话", metrics["sessions"])
-    c2.metric("平均得分", metrics["avg_score"])
-    c3.metric("累计时长", f"{round(metrics['total_seconds'] / 60, 1)} 分钟")
-    st.subheader("最近埋点")
-    events = recent_events(100)
-    if events:
-        st.dataframe(
-            [{"时间": e["created_at"], "事件": e["event_name"], "页面": e["page_name"], "会话": e["session_id"], "参数": e["event_params"]} for e in events],
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.info("暂无埋点数据。")
-    st.caption(f"SQLite 文件：{DB_PATH}")
-
-
 nav = sidebar()
 if st.session_state.active_session_id:
     render_interview(st.session_state.active_session_id)
@@ -508,10 +592,8 @@ elif nav == "面试大厅":
     render_home()
 elif nav == "面试记录":
     render_history()
-elif nav == "面试题库":
-    render_library()
 else:
-    render_dashboard()
+    render_library()
 
 if st.session_state.show_config:
     config_dialog()

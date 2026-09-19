@@ -11,7 +11,7 @@ from typing import Any, Iterable
 from xml.etree import ElementTree as ET
 
 from ai_client import AIServiceError, analyze_interview_answer, generate_interview_question
-from db import UPLOAD_DIR, fetch_all, fetch_one, log_event, transaction
+from db import fetch_all, fetch_one, log_event, transaction
 
 
 INTERVIEW_TYPES = ("科研面", "英语面", "专业面", "行为面")
@@ -28,6 +28,24 @@ DIMENSION_LABELS = {
     "clarity_score": "表达清晰度",
     "response_score": "临场反应",
 }
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+MAX_ANSWER_CHARS = 3000
+DAILY_SESSION_LIMIT = 3
+GLOBAL_DAILY_SESSION_LIMIT = 30
+
+
+class UsageLimitError(ValueError):
+    pass
+
+
+def _owned_session(conn: sqlite3.Connection, session_id: int, visitor_id: str) -> sqlite3.Row:
+    session = conn.execute(
+        "SELECT * FROM interview_sessions WHERE session_id = ? AND visitor_id = ?",
+        (session_id, visitor_id),
+    ).fetchone()
+    if not session:
+        raise ValueError("面试会话不存在或无权访问")
+    return session
 
 
 def extract_text(file_name: str, data: bytes) -> tuple[str, str]:
@@ -50,28 +68,42 @@ def extract_text(file_name: str, data: bytes) -> tuple[str, str]:
 
 def save_material(
     *,
+    visitor_id: str,
     session_id: int | None,
     material_type: str,
     file_name: str,
     data: bytes,
 ) -> int:
+    if not data:
+        raise ValueError("上传文件为空")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError("单个文件不能超过 5MB")
     content_text, parse_status = extract_text(file_name, data)
-    safe_name = re.sub(r"[^\w.\-\u4e00-\u9fff]", "_", Path(file_name).name)
-    folder = UPLOAD_DIR / (str(session_id) if session_id else "library")
-    folder.mkdir(parents=True, exist_ok=True)
-    target = folder / f"{datetime.now():%Y%m%d%H%M%S%f}_{safe_name}"
-    target.write_bytes(data)
     with transaction() as conn:
+        if session_id is not None:
+            _owned_session(conn, session_id, visitor_id)
         cursor = conn.execute(
             """
-            INSERT INTO materials(session_id, material_type, file_name, file_type, file_size, content_text, parse_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO materials(
+                session_id, visitor_id, material_type, file_name, file_type,
+                file_size, content_text, parse_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (session_id, material_type, file_name, Path(file_name).suffix.lower(), len(data), content_text, parse_status),
+            (
+                session_id,
+                visitor_id,
+                material_type,
+                Path(file_name).name,
+                Path(file_name).suffix.lower(),
+                len(data),
+                content_text,
+                parse_status,
+            ),
         )
         material_id = int(cursor.lastrowid)
     log_event(
         "material_upload_success",
+        visitor_id,
         session_id,
         "配置页" if session_id else "面试题库",
         {"material_type": material_type, "file_name": file_name, "file_size": len(data)},
@@ -80,33 +112,59 @@ def save_material(
 
 
 def create_session(
+    visitor_id: str,
     selection: str,
     user_major: str,
     counts: dict[str, int],
     extra_requirement: str,
 ) -> int:
+    if selection not in {"全流程面试", *INTERVIEW_TYPES}:
+        raise ValueError("无效的面试类型")
+    cleaned_major = user_major.strip()
+    cleaned_requirement = extra_requirement.strip()
+    if not cleaned_major or len(cleaned_major) > 80:
+        raise ValueError("目标专业需填写，且不能超过 80 字")
+    if len(cleaned_requirement) > 500:
+        raise ValueError("附加要求不能超过 500 字")
     practice_mode = "全流程面试" if selection == "全流程面试" else "单项面试"
     interview_type = None if practice_mode == "全流程面试" else selection
     if practice_mode == "全流程面试":
         counts = {kind: 1 for kind in INTERVIEW_TYPES}
+    elif not 1 <= int(counts.get(selection, 0)) <= 5:
+        raise ValueError("单项面试题量需为 1 到 5 题")
     started_at = datetime.now().isoformat(timespec="seconds")
     with transaction() as conn:
+        today_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM interview_sessions
+            WHERE visitor_id = ? AND date(created_at, 'localtime') = date('now', 'localtime')
+            """,
+            (visitor_id,),
+        ).fetchone()[0]
+        if int(today_count) >= DAILY_SESSION_LIMIT:
+            raise UsageLimitError("今天已完成 3 次体验，请明天再来练习。")
+        global_today_count = conn.execute(
+            "SELECT COUNT(*) FROM interview_sessions WHERE date(created_at, 'localtime') = date('now', 'localtime')"
+        ).fetchone()[0]
+        if int(global_today_count) >= GLOBAL_DAILY_SESSION_LIMIT:
+            raise UsageLimitError("今天的公开体验名额已用完，请明天再来。")
         cursor = conn.execute(
             """
             INSERT INTO interview_sessions(
-                practice_mode, interview_type, user_major, research_count, english_count,
+                visitor_id, practice_mode, interview_type, user_major, research_count, english_count,
                 professional_count, behavior_count, extra_requirement, status, started_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?)
             """,
             (
+                visitor_id,
                 practice_mode,
                 interview_type,
-                user_major.strip(),
+                cleaned_major,
                 counts.get("科研面", 0),
                 counts.get("英语面", 0),
                 counts.get("专业面", 0),
                 counts.get("行为面", 0),
-                extra_requirement.strip(),
+                cleaned_requirement,
                 started_at,
             ),
         )
@@ -149,6 +207,7 @@ def _material_question(material: sqlite3.Row, interview_type: str, index: int) -
 def generate_questions_from_materials(
     conn: sqlite3.Connection,
     session_id: int,
+    visitor_id: str,
     requested_types: Iterable[str],
     user_major: str = "",
     extra_requirement: str = "",
@@ -157,10 +216,10 @@ def generate_questions_from_materials(
     materials = conn.execute(
         """
         SELECT * FROM materials
-        WHERE session_id = ? OR session_id IS NULL
+        WHERE visitor_id = ? AND (session_id = ? OR session_id IS NULL)
         ORDER BY CASE WHEN session_id = ? THEN 0 ELSE 1 END, uploaded_at DESC
         """,
-        (session_id, session_id),
+        (visitor_id, session_id, session_id),
     ).fetchall()
     generated: list[dict[str, Any]] = []
     type_indices: Counter[str] = Counter()
@@ -184,6 +243,7 @@ def generate_questions_from_materials(
                 question_text = _material_question(material, interview_type, index)
                 log_event(
                     "ai_fallback_used",
+                    visitor_id,
                     session_id,
                     "抽题服务",
                     {"task": "question_generation", "reason": str(exc)[:200]},
@@ -221,11 +281,9 @@ def generate_questions_from_materials(
     return generated
 
 
-def generate_session_questions(session_id: int) -> list[sqlite3.Row]:
+def generate_session_questions(session_id: int, visitor_id: str) -> list[sqlite3.Row]:
     with transaction() as conn:
-        session = conn.execute("SELECT * FROM interview_sessions WHERE session_id = ?", (session_id,)).fetchone()
-        if not session:
-            raise ValueError("面试会话不存在")
+        session = _owned_session(conn, session_id, visitor_id)
         existing = conn.execute(
             "SELECT * FROM session_questions WHERE session_id = ? ORDER BY sequence_no", (session_id,)
         ).fetchall()
@@ -241,6 +299,7 @@ def generate_session_questions(session_id: int) -> list[sqlite3.Row]:
         questions = generate_questions_from_materials(
             conn,
             session_id,
+            visitor_id,
             requested_types,
             user_major=session["user_major"],
             extra_requirement=session["extra_requirement"] or "",
@@ -265,10 +324,11 @@ def generate_session_questions(session_id: int) -> list[sqlite3.Row]:
                     question["generation_method"],
                 ),
             )
-    rows = get_session_questions(session_id)
+    rows = get_session_questions(session_id, visitor_id)
     for row in rows:
         log_event(
             "ai_question_generated",
+            visitor_id,
             session_id,
             "模拟面试",
             {"question_id": row["session_question_id"], "question_type": row["interview_type"], "source_type": row["source_type"]},
@@ -276,9 +336,15 @@ def generate_session_questions(session_id: int) -> list[sqlite3.Row]:
     return rows
 
 
-def get_session_questions(session_id: int) -> list[sqlite3.Row]:
+def get_session_questions(session_id: int, visitor_id: str) -> list[sqlite3.Row]:
     return fetch_all(
-        "SELECT * FROM session_questions WHERE session_id = ? ORDER BY sequence_no", (session_id,)
+        """
+        SELECT sq.* FROM session_questions sq
+        JOIN interview_sessions s ON s.session_id = sq.session_id
+        WHERE sq.session_id = ? AND s.visitor_id = ?
+        ORDER BY sq.sequence_no
+        """,
+        (session_id, visitor_id),
     )
 
 
@@ -328,11 +394,25 @@ def evaluate_answer(answer_text: str, interview_type: str) -> dict[str, Any]:
     }
 
 
-def submit_answer(session_id: int, session_question_id: int, answer_text: str, duration: int = 0) -> dict[str, Any]:
+def submit_answer(
+    session_id: int,
+    session_question_id: int,
+    answer_text: str,
+    visitor_id: str,
+    duration: int = 0,
+) -> dict[str, Any]:
     cleaned_answer = answer_text.strip()
+    if not cleaned_answer:
+        raise ValueError("回答不能为空")
+    if len(cleaned_answer) > MAX_ANSWER_CHARS:
+        raise ValueError("回答不能超过 3000 字")
     question = fetch_one(
-        "SELECT * FROM session_questions WHERE session_question_id = ? AND session_id = ?",
-        (session_question_id, session_id),
+        """
+        SELECT sq.* FROM session_questions sq
+        JOIN interview_sessions s ON s.session_id = sq.session_id
+        WHERE sq.session_question_id = ? AND sq.session_id = ? AND s.visitor_id = ?
+        """,
+        (session_question_id, session_id, visitor_id),
     )
     if not question:
         raise ValueError("题目不存在")
@@ -364,6 +444,7 @@ def submit_answer(session_id: int, session_question_id: int, answer_text: str, d
         result = evaluate_answer(answer_text, question["interview_type"])
         log_event(
             "ai_fallback_used",
+            visitor_id,
             session_id,
             "评分服务",
             {"task": "answer_evaluation", "question_id": session_question_id, "reason": str(exc)[:200]},
@@ -403,7 +484,13 @@ def submit_answer(session_id: int, session_question_id: int, answer_text: str, d
                 result["evaluation_method"],
             ),
         )
-    log_event("answer_submitted", session_id, "模拟面试", {"question_id": session_question_id, "score": result["overall_score"]})
+    log_event(
+        "answer_submitted",
+        visitor_id,
+        session_id,
+        "模拟面试",
+        {"question_id": session_question_id, "score": result["overall_score"]},
+    )
     return result
 
 
@@ -412,9 +499,11 @@ def maybe_generate_followup(
     session_question_id: int,
     answer_text: str,
     evaluation: dict[str, Any],
+    visitor_id: str,
 ) -> int | None:
     """Insert one rule-based follow-up immediately after a weak/short base answer."""
     with transaction() as conn:
+        _owned_session(conn, session_id, visitor_id)
         question = conn.execute(
             "SELECT * FROM session_questions WHERE session_id=? AND session_question_id=?",
             (session_id, session_question_id),
@@ -466,6 +555,7 @@ def maybe_generate_followup(
         followup_id = int(cursor.lastrowid)
     log_event(
         "ai_followup_generated",
+        visitor_id,
         session_id,
         "模拟面试",
         {"question_id": followup_id, "parent_question_id": session_question_id, "weak_dimension": evaluation["weak_dimension"]},
@@ -473,8 +563,13 @@ def maybe_generate_followup(
     return followup_id
 
 
-def finish_session(session_id: int) -> None:
-    session = fetch_one("SELECT started_at FROM interview_sessions WHERE session_id=?", (session_id,))
+def finish_session(session_id: int, visitor_id: str) -> None:
+    session = fetch_one(
+        "SELECT started_at FROM interview_sessions WHERE session_id=? AND visitor_id=?",
+        (session_id, visitor_id),
+    )
+    if not session:
+        raise ValueError("面试会话不存在或无权访问")
     started_at = datetime.fromisoformat(session["started_at"]) if session and session["started_at"] else datetime.now()
     finished_at = datetime.now()
     duration = max(0, int((finished_at - started_at).total_seconds()))
@@ -483,16 +578,19 @@ def finish_session(session_id: int) -> None:
             """
             UPDATE interview_sessions
             SET status='completed', finished_at=?, duration_seconds=?
-            WHERE session_id=?
+            WHERE session_id=? AND visitor_id=?
             """,
-            (finished_at.isoformat(timespec="seconds"), duration, session_id),
+            (finished_at.isoformat(timespec="seconds"), duration, session_id, visitor_id),
         )
     answered = fetch_one("SELECT COUNT(*) AS count FROM answers WHERE session_id=?", (session_id,))["count"]
-    log_event("interview_finished", session_id, "模拟面试", {"completed_question_count": answered})
+    log_event("interview_finished", visitor_id, session_id, "模拟面试", {"completed_question_count": answered})
 
 
-def get_report(session_id: int) -> dict[str, Any] | None:
-    session = fetch_one("SELECT * FROM interview_sessions WHERE session_id=?", (session_id,))
+def get_report(session_id: int, visitor_id: str) -> dict[str, Any] | None:
+    session = fetch_one(
+        "SELECT * FROM interview_sessions WHERE session_id=? AND visitor_id=?",
+        (session_id, visitor_id),
+    )
     if not session:
         return None
     summary = fetch_one(
@@ -528,7 +626,7 @@ def get_report(session_id: int) -> dict[str, Any] | None:
     return {"session": session, "summary": summary, "details": details, "weaknesses": weak_rows}
 
 
-def list_sessions() -> list[sqlite3.Row]:
+def list_sessions(visitor_id: str) -> list[sqlite3.Row]:
     return fetch_all(
         """
         SELECT s.*, COUNT(DISTINCT sq.session_question_id) AS question_count,
@@ -536,13 +634,18 @@ def list_sessions() -> list[sqlite3.Row]:
         FROM interview_sessions s
         LEFT JOIN session_questions sq ON sq.session_id=s.session_id
         LEFT JOIN answers a ON a.session_id=s.session_id
+        WHERE s.visitor_id = ?
         GROUP BY s.session_id ORDER BY s.created_at DESC
-        """
+        """,
+        (visitor_id,),
     )
 
 
-def list_materials() -> list[sqlite3.Row]:
-    return fetch_all("SELECT * FROM materials ORDER BY uploaded_at DESC")
+def list_materials(visitor_id: str) -> list[sqlite3.Row]:
+    return fetch_all(
+        "SELECT * FROM materials WHERE visitor_id = ? ORDER BY uploaded_at DESC",
+        (visitor_id,),
+    )
 
 
 def list_questions(interview_type: str | None = None) -> list[sqlite3.Row]:
@@ -551,16 +654,43 @@ def list_questions(interview_type: str | None = None) -> list[sqlite3.Row]:
     return fetch_all("SELECT * FROM questions ORDER BY interview_type, question_id")
 
 
-def dashboard_metrics() -> dict[str, Any]:
+def dashboard_metrics(visitor_id: str) -> dict[str, Any]:
     row = fetch_one(
         """
-        SELECT (SELECT COUNT(*) FROM interview_sessions) AS sessions,
-               COALESCE((SELECT ROUND(AVG(overall_score),1) FROM answers),0) AS avg_score,
-               COALESCE((SELECT SUM(duration_seconds) FROM interview_sessions),0) AS total_seconds
-        """
+        SELECT (SELECT COUNT(*) FROM interview_sessions WHERE visitor_id=?) AS sessions,
+               COALESCE((
+                   SELECT ROUND(AVG(a.overall_score),1) FROM answers a
+                   JOIN interview_sessions s ON s.session_id=a.session_id
+                   WHERE s.visitor_id=?
+               ),0) AS avg_score,
+               COALESCE((SELECT SUM(duration_seconds) FROM interview_sessions WHERE visitor_id=?),0) AS total_seconds
+        """,
+        (visitor_id, visitor_id, visitor_id),
     )
     return dict(row) if row else {"sessions": 0, "avg_score": 0, "total_seconds": 0}
 
 
-def recent_events(limit: int = 100) -> list[sqlite3.Row]:
-    return fetch_all("SELECT * FROM event_logs ORDER BY event_id DESC LIMIT ?", (limit,))
+def recent_events(visitor_id: str, limit: int = 100) -> list[sqlite3.Row]:
+    return fetch_all(
+        "SELECT * FROM event_logs WHERE visitor_id=? ORDER BY event_id DESC LIMIT ?",
+        (visitor_id, limit),
+    )
+
+
+def daily_session_count(visitor_id: str) -> int:
+    row = fetch_one(
+        """
+        SELECT COUNT(*) AS count
+        FROM interview_sessions
+        WHERE visitor_id = ? AND date(created_at, 'localtime') = date('now', 'localtime')
+        """,
+        (visitor_id,),
+    )
+    return int(row["count"]) if row else 0
+
+
+def clear_visitor_data(visitor_id: str) -> None:
+    with transaction() as conn:
+        conn.execute("DELETE FROM interview_sessions WHERE visitor_id=?", (visitor_id,))
+        conn.execute("DELETE FROM materials WHERE visitor_id=?", (visitor_id,))
+        conn.execute("DELETE FROM event_logs WHERE visitor_id=?", (visitor_id,))
