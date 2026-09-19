@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import io
 import re
-import sqlite3
 import zipfile
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree as ET
+from zoneinfo import ZoneInfo
 
 from ai_client import AIServiceError, analyze_interview_answer, generate_interview_question
 from db import fetch_all, fetch_one, log_event, transaction
@@ -38,7 +38,7 @@ class UsageLimitError(ValueError):
     pass
 
 
-def _owned_session(conn: sqlite3.Connection, session_id: int, visitor_id: str) -> sqlite3.Row:
+def _owned_session(conn: Any, session_id: int, visitor_id: str) -> Any:
     session = conn.execute(
         "SELECT * FROM interview_sessions WHERE session_id = ? AND visitor_id = ?",
         (session_id, visitor_id),
@@ -46,6 +46,16 @@ def _owned_session(conn: sqlite3.Connection, session_id: int, visitor_id: str) -
     if not session:
         raise ValueError("面试会话不存在或无权访问")
     return session
+
+
+def _china_day_window() -> tuple[datetime, datetime]:
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.astimezone(timezone.utc), (start + timedelta(days=1)).astimezone(timezone.utc)
+
+
+def _sql_timestamp(value: datetime) -> str:
+    return value.isoformat(sep=" ", timespec="seconds")
 
 
 def extract_text(file_name: str, data: bytes) -> tuple[str, str]:
@@ -88,6 +98,7 @@ def save_material(
                 session_id, visitor_id, material_type, file_name, file_type,
                 file_size, content_text, parse_status
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING material_id
             """,
             (
                 session_id,
@@ -100,7 +111,7 @@ def save_material(
                 parse_status,
             ),
         )
-        material_id = int(cursor.lastrowid)
+        material_id = int(cursor.fetchone()["material_id"])
     log_event(
         "material_upload_success",
         visitor_id,
@@ -133,19 +144,21 @@ def create_session(
     elif not 1 <= int(counts.get(selection, 0)) <= 5:
         raise ValueError("单项面试题量需为 1 到 5 题")
     started_at = datetime.now().isoformat(timespec="seconds")
+    day_start, day_end = _china_day_window()
     with transaction() as conn:
         today_count = conn.execute(
             """
-            SELECT COUNT(*) FROM interview_sessions
-            WHERE visitor_id = ? AND date(created_at, 'localtime') = date('now', 'localtime')
+            SELECT COUNT(*) AS count FROM interview_sessions
+            WHERE visitor_id = ? AND created_at >= ? AND created_at < ?
             """,
-            (visitor_id,),
-        ).fetchone()[0]
+            (visitor_id, _sql_timestamp(day_start), _sql_timestamp(day_end)),
+        ).fetchone()["count"]
         if int(today_count) >= DAILY_SESSION_LIMIT:
             raise UsageLimitError("今天已完成 3 次体验，请明天再来练习。")
         global_today_count = conn.execute(
-            "SELECT COUNT(*) FROM interview_sessions WHERE date(created_at, 'localtime') = date('now', 'localtime')"
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS count FROM interview_sessions WHERE created_at >= ? AND created_at < ?",
+            (_sql_timestamp(day_start), _sql_timestamp(day_end)),
+        ).fetchone()["count"]
         if int(global_today_count) >= GLOBAL_DAILY_SESSION_LIMIT:
             raise UsageLimitError("今天的公开体验名额已用完，请明天再来。")
         cursor = conn.execute(
@@ -154,6 +167,7 @@ def create_session(
                 visitor_id, practice_mode, interview_type, user_major, research_count, english_count,
                 professional_count, behavior_count, extra_requirement, status, started_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?)
+            RETURNING session_id
             """,
             (
                 visitor_id,
@@ -168,11 +182,11 @@ def create_session(
                 started_at,
             ),
         )
-        return int(cursor.lastrowid)
+        return int(cursor.fetchone()["session_id"])
 
 
-def _material_for_type(materials: list[sqlite3.Row], interview_type: str) -> sqlite3.Row | None:
-    by_type: dict[str, list[sqlite3.Row]] = {}
+def _material_for_type(materials: list[Any], interview_type: str) -> Any | None:
+    by_type: dict[str, list[Any]] = {}
     for material in materials:
         by_type.setdefault(material["material_type"], []).append(material)
     if by_type.get("院校面试真题"):
@@ -184,7 +198,7 @@ def _material_for_type(materials: list[sqlite3.Row], interview_type: str) -> sql
     return None
 
 
-def _material_question(material: sqlite3.Row, interview_type: str, index: int) -> str:
+def _material_question(material: Any, interview_type: str, index: int) -> str:
     source_text = (material["content_text"] or "").strip()
     lines = [
         re.sub(r"^[\d一二三四五六七八九十、.()（）\-\s]+", "", line).strip()
@@ -205,7 +219,7 @@ def _material_question(material: sqlite3.Row, interview_type: str, index: int) -
 
 
 def generate_questions_from_materials(
-    conn: sqlite3.Connection,
+    conn: Any,
     session_id: int,
     visitor_id: str,
     requested_types: Iterable[str],
@@ -281,7 +295,7 @@ def generate_questions_from_materials(
     return generated
 
 
-def generate_session_questions(session_id: int, visitor_id: str) -> list[sqlite3.Row]:
+def generate_session_questions(session_id: int, visitor_id: str) -> list[Any]:
     with transaction() as conn:
         session = _owned_session(conn, session_id, visitor_id)
         existing = conn.execute(
@@ -336,7 +350,7 @@ def generate_session_questions(session_id: int, visitor_id: str) -> list[sqlite3
     return rows
 
 
-def get_session_questions(session_id: int, visitor_id: str) -> list[sqlite3.Row]:
+def get_session_questions(session_id: int, visitor_id: str) -> list[Any]:
     return fetch_all(
         """
         SELECT sq.* FROM session_questions sq
@@ -539,6 +553,7 @@ def maybe_generate_followup(
                 session_id, sequence_no, interview_type, question_text, source_scope, source_type,
                 source_question_id, source_material_id, parent_session_question_id, generation_method, is_followup
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'rule_followup', 1)
+            RETURNING session_question_id
             """,
             (
                 session_id,
@@ -552,7 +567,7 @@ def maybe_generate_followup(
                 session_question_id,
             ),
         )
-        followup_id = int(cursor.lastrowid)
+        followup_id = int(cursor.fetchone()["session_question_id"])
     log_event(
         "ai_followup_generated",
         visitor_id,
@@ -626,7 +641,7 @@ def get_report(session_id: int, visitor_id: str) -> dict[str, Any] | None:
     return {"session": session, "summary": summary, "details": details, "weaknesses": weak_rows}
 
 
-def list_sessions(visitor_id: str) -> list[sqlite3.Row]:
+def list_sessions(visitor_id: str) -> list[Any]:
     return fetch_all(
         """
         SELECT s.*, COUNT(DISTINCT sq.session_question_id) AS question_count,
@@ -641,14 +656,14 @@ def list_sessions(visitor_id: str) -> list[sqlite3.Row]:
     )
 
 
-def list_materials(visitor_id: str) -> list[sqlite3.Row]:
+def list_materials(visitor_id: str) -> list[Any]:
     return fetch_all(
         "SELECT * FROM materials WHERE visitor_id = ? ORDER BY uploaded_at DESC",
         (visitor_id,),
     )
 
 
-def list_questions(interview_type: str | None = None) -> list[sqlite3.Row]:
+def list_questions(interview_type: str | None = None) -> list[Any]:
     if interview_type and interview_type != "全部":
         return fetch_all("SELECT * FROM questions WHERE interview_type=? ORDER BY question_id", (interview_type,))
     return fetch_all("SELECT * FROM questions ORDER BY interview_type, question_id")
@@ -670,7 +685,7 @@ def dashboard_metrics(visitor_id: str) -> dict[str, Any]:
     return dict(row) if row else {"sessions": 0, "avg_score": 0, "total_seconds": 0}
 
 
-def recent_events(visitor_id: str, limit: int = 100) -> list[sqlite3.Row]:
+def recent_events(visitor_id: str, limit: int = 100) -> list[Any]:
     return fetch_all(
         "SELECT * FROM event_logs WHERE visitor_id=? ORDER BY event_id DESC LIMIT ?",
         (visitor_id, limit),
@@ -678,13 +693,14 @@ def recent_events(visitor_id: str, limit: int = 100) -> list[sqlite3.Row]:
 
 
 def daily_session_count(visitor_id: str) -> int:
+    day_start, day_end = _china_day_window()
     row = fetch_one(
         """
         SELECT COUNT(*) AS count
         FROM interview_sessions
-        WHERE visitor_id = ? AND date(created_at, 'localtime') = date('now', 'localtime')
+        WHERE visitor_id = ? AND created_at >= ? AND created_at < ?
         """,
-        (visitor_id,),
+        (visitor_id, _sql_timestamp(day_start), _sql_timestamp(day_end)),
     )
     return int(row["count"]) if row else 0
 

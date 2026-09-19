@@ -211,6 +211,48 @@ class YanyanMvpTests(unittest.TestCase):
             )
         self.assertEqual([], services.list_sessions(self.VISITOR_A))
 
+    def test_partial_supabase_config_is_rejected(self) -> None:
+        with patch.dict(os.environ, {"SUPABASE_DB_HOST": "pooler.example.com"}, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "配置不完整"):
+                db.postgres_settings()
+
+    def test_postgres_placeholder_conversion(self) -> None:
+        class FakeConnection:
+            def execute(self, sql, params):
+                return sql, params
+
+        connection = db.DatabaseConnection(FakeConnection(), "postgres")
+        sql, params = connection.execute("SELECT * FROM questions WHERE question_id=?", (7,))
+        self.assertEqual("SELECT * FROM questions WHERE question_id=%s", sql)
+        self.assertEqual((7,), params)
+
+    def test_transaction_pooler_connection_disables_prepared_statements(self) -> None:
+        settings = {
+            "SUPABASE_DB_HOST": "pooler.example.com",
+            "SUPABASE_DB_PORT": "6543",
+            "SUPABASE_DB_NAME": "postgres",
+            "SUPABASE_DB_USER": "postgres.project-ref",
+            "SUPABASE_DB_PASSWORD": "test-password",
+        }
+        with patch.dict(os.environ, settings, clear=False), patch("psycopg.connect") as connect_mock:
+            connection = db.connect()
+        self.assertEqual("postgres", connection.backend)
+        self.assertEqual(6543, connect_mock.call_args.kwargs["port"])
+        self.assertEqual("require", connect_mock.call_args.kwargs["sslmode"])
+        self.assertIsNone(connect_mock.call_args.kwargs["prepare_threshold"])
+
+    def test_postgres_schema_enables_rls_for_all_core_tables(self) -> None:
+        schema = db.POSTGRES_SCHEMA_PATH.read_text(encoding="utf-8")
+        for table in (
+            "questions",
+            "interview_sessions",
+            "materials",
+            "session_questions",
+            "answers",
+            "event_logs",
+        ):
+            self.assertIn(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY", schema)
+
     def test_json_parser_accepts_code_fence_and_explanation(self) -> None:
         payload = _parse_json('结果如下：\n```json\n{"ok": true}\n```')
         self.assertIs(payload["ok"], True)

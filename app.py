@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import os
 import re
 import uuid
@@ -9,7 +10,7 @@ from datetime import datetime
 import streamlit as st
 
 from ai_client import AIServiceError, provider_status, test_connection
-from db import init_db, log_event
+from db import database_backend, init_db, log_event
 from services import (
     DIMENSION_LABELS,
     INTERVIEW_TYPES,
@@ -32,8 +33,29 @@ from services import (
 )
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 st.set_page_config(page_title="言言陪练", page_icon="言", layout="wide", initial_sidebar_state="expanded")
-init_db()
+
+
+@st.cache_resource
+def initialize_database() -> str:
+    init_db()
+    return database_backend()
+
+
+try:
+    DATABASE_BACKEND = initialize_database()
+except RuntimeError as exc:
+    st.error(f"数据库配置错误：{exc}")
+    st.info("请检查 Streamlit Cloud 的 Supabase Secrets 是否完整，并确认使用 Transaction pooler 参数。")
+    st.stop()
+except Exception:
+    LOGGER.exception("Supabase database initialization failed")
+    st.error("云数据库暂时无法连接，请稍后重试。")
+    st.info("应用管理员可在 Streamlit Cloud 日志中查看具体原因。")
+    st.stop()
 
 
 def apply_styles() -> None:
@@ -143,6 +165,10 @@ def sidebar() -> str:
         st.session_state.sidebar_nav = target
     current = st.sidebar.radio("导航", options, key="sidebar_nav", label_visibility="collapsed")
     st.sidebar.caption("保研 AI 面试助手 · MVP")
+    if DATABASE_BACKEND == "postgres":
+        st.sidebar.caption("数据存储：Supabase 云数据库")
+    else:
+        st.sidebar.caption("数据存储：本地 SQLite")
     ai_enabled, ai_message = provider_status()
     if ai_enabled:
         st.sidebar.success(ai_message)
@@ -549,7 +575,7 @@ def render_report(session_id: int) -> None:
     score_cols = st.columns(5)
     for column, (key, label) in zip(score_cols, DIMENSION_LABELS.items()):
         column.metric(label, f"{summary[key] or 0} 分")
-        column.progress((summary[key] or 0) / 100)
+        column.progress(float(summary[key] or 0) / 100)
     st.subheader("逐题分析")
     for item in details:
         kind_label = "追问" if item["is_followup"] else item["interview_type"]

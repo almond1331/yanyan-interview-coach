@@ -1,6 +1,6 @@
 # 言言陪练 MVP
 
-一个使用 Python、Streamlit 和 SQLite 实现的保研面试文字陪练闭环：
+一个使用 Python、Streamlit、Supabase Postgres 和 SQLite 实现的保研面试文字陪练闭环：
 
 `面试大厅 → 三步配置 → 抽题/生成题 → 文字作答 → AI 评分 → 报告与训练计划 → 历史记录`
 
@@ -10,9 +10,10 @@
 言言陪练-mvp/
 ├─ app.py                  # Streamlit 页面与交互流程
 ├─ ai_client.py            # DeepSeek API、JSON 校验、超时和错误处理
-├─ db.py                   # SQLite 连接、初始化、示例数据与埋点
+├─ db.py                   # Supabase/SQLite 连接、初始化、示例数据与埋点
 ├─ services.py             # 出题优先级、资料解析、评分、报告服务
 ├─ schema.sql              # 六张核心表、约束与索引
+├─ schema_postgres.sql     # Supabase Postgres 表结构、索引与 RLS
 ├─ queries.sql             # 历史、来源、维度、漏斗等分析 SQL
 ├─ requirements.txt
 ├─ .streamlit/config.toml # 服务端上传与消息大小限制
@@ -74,7 +75,21 @@ python -m streamlit run app.py
 - 侧边栏“隐私与数据”可以清除当前匿名访客的会话、回答、资料和埋点。
 - 资料片段和回答会发送给 DeepSeek。请勿上传身份证、电话、住址等无关敏感信息。
 
-Streamlit Community Cloud 的本地 SQLite 文件可能在休眠、重启或重新部署后丢失。因此当前版本已完成数据隔离与公开体验保护，但不承诺云端历史永久保存。下一阶段应把这六张表迁移到 Supabase Postgres，再将 `db.py` 的连接层切换为云数据库。
+配置 Supabase Secrets 后，Streamlit Cloud 使用 Supabase Postgres 持久化数据；未配置时自动使用本地 SQLite，便于本地开发和自动测试。首次切换到 Supabase 后，原 Streamlit 临时 SQLite 中的历史不会自动迁移，后续新数据会持久保存。
+
+Supabase 使用 Transaction pooler（通常为端口 6543）和 SSL 连接。代码关闭服务端预编译语句以兼容事务连接池，并为六张表启用 RLS；应用通过仅存放在 Streamlit Secrets 中的数据库账号访问，浏览器不会拿到数据库凭据。
+
+Streamlit Cloud 的 Secrets 需要包含：
+
+```toml
+SUPABASE_DB_HOST = "aws-0-区域.pooler.supabase.com"
+SUPABASE_DB_PORT = 6543
+SUPABASE_DB_NAME = "postgres"
+SUPABASE_DB_USER = "postgres.项目编号"
+SUPABASE_DB_PASSWORD = "数据库密码"
+```
+
+不要将这些真实值写入仓库。部署后侧边栏显示“数据存储：Supabase 云数据库”即表示切换成功。
 
 ## MVP 出题规则
 
