@@ -173,6 +173,17 @@ def sidebar() -> str:
 
 
 def start_config(mode: str) -> None:
+    st.session_state.pop("config_profile", None)
+    st.session_state.pop("config_preferences", None)
+    for widget_key in (
+        "config_major",
+        "config_resume",
+        "config_material_type",
+        "config_materials",
+        "config_extra",
+        "config_camera",
+    ):
+        st.session_state.pop(widget_key, None)
     st.session_state.selected_mode = mode
     st.session_state.show_config = True
     st.session_state.config_step = 1
@@ -198,17 +209,25 @@ def config_dialog() -> None:
         st.rerun()
 
     if step == 1:
+        saved_profile = st.session_state.get("config_profile", {})
+        st.session_state.setdefault("config_major", saved_profile.get("major", ""))
+        st.session_state.setdefault("config_material_type", saved_profile.get("material_type", "专业资料"))
         st.subheader("完善用户信息")
         st.caption("专业为必填；上传资料后，言言会按题型匹配最合适的来源。")
         ai_enabled, _ = provider_status()
         if ai_enabled:
             st.info("AI 模式已开启：上传的资料片段和面试回答会发送给 DeepSeek 用于本轮出题与反馈。请勿上传身份证号等无关敏感信息。")
         major = st.text_input(
-            "目标专业 / 申请方向 *", key="config_major", max_chars=80, placeholder="例如：计算机科学与技术"
+            "目标专业 / 申请方向 *",
+            key="config_major",
+            max_chars=80,
+            placeholder="例如：计算机科学与技术",
         )
         resume = st.file_uploader("个人简历（选填，最大 5MB）", type=["pdf", "docx", "txt"], key="config_resume")
         material_type = st.segmented_control(
-            "练习资料类型", ["院校面试真题", "专业资料", "其他资料"], default="专业资料", key="config_material_type"
+            "练习资料类型",
+            ["院校面试真题", "专业资料", "其他资料"],
+            key="config_material_type",
         )
         practice_files = st.file_uploader(
             "练习资料（选填，可多选，单个最大 5MB）",
@@ -216,6 +235,24 @@ def config_dialog() -> None:
             accept_multiple_files=True,
             key="config_materials",
         )
+        saved_resume = (
+            {"name": resume.name, "size": resume.size, "data": resume.getvalue()}
+            if resume
+            else saved_profile.get("resume")
+        )
+        saved_materials = (
+            [{"name": item.name, "size": item.size, "data": item.getvalue()} for item in practice_files]
+            if practice_files
+            else saved_profile.get("materials", [])
+        )
+        st.session_state.config_profile = {
+            "major": major.strip(),
+            "resume": saved_resume,
+            "material_type": material_type,
+            "materials": saved_materials,
+        }
+        if saved_resume or saved_materials:
+            st.caption(f"已暂存 {int(bool(saved_resume)) + len(saved_materials)} 个文件，进入下一步后不会丢失。")
         _, right = st.columns([3, 1])
         with right:
             if st.button("继续", type="primary", use_container_width=True, disabled=not major.strip()):
@@ -223,6 +260,8 @@ def config_dialog() -> None:
                 st.rerun()
     elif step == 2:
         mode = st.session_state.selected_mode
+        saved_preferences = st.session_state.get("config_preferences", {})
+        st.session_state.setdefault("config_extra", saved_preferences.get("extra_requirement", ""))
         st.subheader("设定面试偏好")
         if mode == "全流程面试":
             st.info("全流程面试固定从科研、英语、专业、行为四类各出 1 题，共 4 题。")
@@ -232,15 +271,19 @@ def config_dialog() -> None:
             for column, kind in zip(st.columns(4), INTERVIEW_TYPES):
                 column.metric(kind, "1 题")
         else:
-            default_count = defaults_for_mode(mode)[mode]
+            default_count = saved_preferences.get("counts", defaults_for_mode(mode)).get(mode, defaults_for_mode(mode)[mode])
             count = st.number_input(f"{mode}题目数量", min_value=1, max_value=5, value=default_count, step=1)
             st.session_state.config_counts = {kind: (int(count) if kind == mode else 0) for kind in INTERVIEW_TYPES}
-        st.text_area(
+        extra_requirement = st.text_area(
             "其他要求（选填）",
             key="config_extra",
             max_chars=500,
             placeholder="例如：多追问科研经历，回答后给出更严格的结构反馈",
         )
+        st.session_state.config_preferences = {
+            "counts": st.session_state.config_counts,
+            "extra_requirement": extra_requirement.strip(),
+        }
         left, _, right = st.columns([1, 2, 1])
         with left:
             if st.button("上一步", use_container_width=True):
@@ -258,9 +301,13 @@ def config_dialog() -> None:
         c2.info("摄像头状态：可选，不影响文字练习")
         camera = st.toggle("模拟开启摄像头", value=False, key="config_camera")
         mode = st.session_state.selected_mode
-        major = st.session_state.get("config_major", "")
-        has_professional = st.session_state.get("config_material_type") == "专业资料" and bool(st.session_state.get("config_materials"))
-        has_exam = st.session_state.get("config_material_type") == "院校面试真题" and bool(st.session_state.get("config_materials"))
+        profile = st.session_state.get("config_profile", {})
+        preferences = st.session_state.get("config_preferences", {})
+        major = profile.get("major", "")
+        material_type = profile.get("material_type", "专业资料")
+        practice_materials = profile.get("materials", [])
+        has_professional = material_type == "专业资料" and bool(practice_materials)
+        has_exam = material_type == "院校面试真题" and bool(practice_materials)
         if (mode in {"专业面", "全流程面试"}) and "会计" not in major and not has_professional and not has_exam:
             st.warning("当前系统专业面题库主要覆盖会计学方向，非会计专业建议上传专业资料后练习。你仍可继续体验现有题库。")
         left, _, right = st.columns([1, 2, 1])
@@ -270,32 +317,30 @@ def config_dialog() -> None:
                 st.rerun()
         with right:
             if st.button("开始面试", type="primary", use_container_width=True, icon=":material/play_arrow:"):
-                counts = st.session_state.get("config_counts", defaults_for_mode(mode))
-                resume = st.session_state.get("config_resume")
-                material_type = st.session_state.get("config_material_type", "专业资料")
-                uploads = ([resume] if resume else []) + list(st.session_state.get("config_materials") or [])
-                if any(uploaded.size > MAX_UPLOAD_BYTES for uploaded in uploads):
+                counts = preferences.get("counts", defaults_for_mode(mode))
+                extra_requirement = preferences.get("extra_requirement", "")
+                resume = profile.get("resume")
+                uploads = ([resume] if resume else []) + list(practice_materials)
+                if any(uploaded["size"] > MAX_UPLOAD_BYTES for uploaded in uploads):
                     st.error("单个文件不能超过 5MB，请压缩后重试。")
                 else:
                     try:
-                        session_id = create_session(
-                            VISITOR_ID, mode, major, counts, st.session_state.get("config_extra", "")
-                        )
+                        session_id = create_session(VISITOR_ID, mode, major, counts, extra_requirement)
                         if resume:
                             save_material(
                                 visitor_id=VISITOR_ID,
                                 session_id=session_id,
                                 material_type="简历",
-                                file_name=resume.name,
-                                data=resume.getvalue(),
+                                file_name=resume["name"],
+                                data=resume["data"],
                             )
-                        for uploaded in st.session_state.get("config_materials") or []:
+                        for uploaded in practice_materials:
                             save_material(
                                 visitor_id=VISITOR_ID,
                                 session_id=session_id,
                                 material_type=material_type,
-                                file_name=uploaded.name,
-                                data=uploaded.getvalue(),
+                                file_name=uploaded["name"],
+                                data=uploaded["data"],
                             )
                         with st.spinner("言言正在准备本轮问题……"):
                             generate_session_questions(session_id, VISITOR_ID)
@@ -314,6 +359,8 @@ def config_dialog() -> None:
                         st.session_state.show_dialog = False
                         st.session_state.camera_on = camera
                         st.session_state.show_config = False
+                        st.session_state.pop("config_profile", None)
+                        st.session_state.pop("config_preferences", None)
                         st.rerun()
                     except (UsageLimitError, ValueError) as exc:
                         st.error(str(exc))
