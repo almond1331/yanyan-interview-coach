@@ -158,9 +158,25 @@ def sidebar() -> str:
                 st.sidebar.error(str(exc))
     else:
         st.sidebar.info(ai_message)
-    st.sidebar.caption("匿名体验：历史仅属于当前浏览器链接，请勿分享带 visitor 参数的完整网址。")
+    st.sidebar.caption(f"匿名体验编号：{VISITOR_ID[-6:]}")
+    st.sidebar.caption("历史属于当前带 visitor 参数的匿名链接。把完整网址发给别人，也会同时分享这份历史。")
     with st.sidebar.expander("隐私与数据"):
         st.caption("资料文本和回答会发送给 DeepSeek 用于出题与反馈。请勿上传身份证、电话等敏感信息。")
+        if st.button("创建全新匿名体验", icon=":material/person_add:", use_container_width=True):
+            new_visitor_id = uuid.uuid4().hex
+            st.session_state.visitor_id = new_visitor_id
+            st.query_params["visitor"] = new_visitor_id
+            for key in (
+                "active_session_id",
+                "report_session_id",
+                "show_config",
+                "last_page_marker",
+                "config_profile",
+                "config_preferences",
+            ):
+                st.session_state.pop(key, None)
+            st.rerun()
+        st.caption("新体验不会删除旧数据；保存旧的完整网址，仍可返回原历史。")
         confirm_clear = st.checkbox("我确认清除当前匿名访客的全部数据", key="confirm_clear_data")
         if st.button("清除我的数据", disabled=not confirm_clear, use_container_width=True):
             clear_visitor_data(VISITOR_ID)
