@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import db
 import services
@@ -234,7 +236,15 @@ class YanyanMvpTests(unittest.TestCase):
             "SUPABASE_DB_USER": "postgres.project-ref",
             "SUPABASE_DB_PASSWORD": "test-password",
         }
-        with patch.dict(os.environ, settings, clear=False), patch("psycopg.connect") as connect_mock:
+        connect_mock = Mock()
+        fake_psycopg = types.ModuleType("psycopg")
+        fake_psycopg.connect = connect_mock
+        fake_rows = types.ModuleType("psycopg.rows")
+        fake_rows.dict_row = object()
+        with (
+            patch.dict(os.environ, settings, clear=False),
+            patch.dict(sys.modules, {"psycopg": fake_psycopg, "psycopg.rows": fake_rows}),
+        ):
             connection = db.connect()
         self.assertEqual("postgres", connection.backend)
         self.assertEqual(6543, connect_mock.call_args.kwargs["port"])
@@ -252,6 +262,12 @@ class YanyanMvpTests(unittest.TestCase):
             "event_logs",
         ):
             self.assertIn(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY", schema)
+
+    def test_database_errors_are_safely_classified(self) -> None:
+        auth_error = RuntimeError("password authentication failed for user")
+        timeout_error = RuntimeError("connection timed out")
+        self.assertEqual("DB-AUTH", db.classify_database_error(auth_error)[0])
+        self.assertEqual("DB-TIMEOUT", db.classify_database_error(timeout_error)[0])
 
     def test_json_parser_accepts_code_fence_and_explanation(self) -> None:
         payload = _parse_json('结果如下：\n```json\n{"ok": true}\n```')

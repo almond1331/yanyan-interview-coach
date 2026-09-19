@@ -140,6 +140,39 @@ def database_backend() -> str:
     return "postgres" if postgres_settings() else "sqlite"
 
 
+def database_config_checks() -> list[tuple[str, bool]]:
+    settings = postgres_settings()
+    if not settings:
+        return [("已配置 Supabase", False)]
+    host = settings.host.lower()
+    return [
+        ("Host 是 Supabase Pooler", "pooler.supabase.com" in host),
+        ("端口是 Transaction pooler 的 6543", settings.port == 6543),
+        ("User 包含项目编号", settings.user.startswith("postgres.") and len(settings.user) > 9),
+        ("Database 是 postgres", settings.dbname == "postgres"),
+    ]
+
+
+def classify_database_error(exc: Exception) -> tuple[str, str]:
+    sqlstate = str(getattr(exc, "sqlstate", "") or "")
+    message = str(exc).lower()
+    if sqlstate in {"28P01", "28000"} or "password authentication failed" in message:
+        return "DB-AUTH", "数据库密码或 User 不正确。请重置数据库密码，并同步更新 Streamlit Secrets。"
+    if "tenant or user not found" in message or "invalid user" in message:
+        return "DB-USER", "Pooler User 或 Host 不匹配。请从同一个 Transaction pooler 面板重新复制两项。"
+    if "could not translate host" in message or "name or service not known" in message:
+        return "DB-HOST", "无法解析 Host。请确认只填写 pooler.supabase.com 结尾的主机名。"
+    if "timeout" in message or "timed out" in message:
+        return "DB-TIMEOUT", "连接超时。请确认使用 Transaction pooler Host 和端口 6543，并检查 Supabase 项目是否已暂停。"
+    if "connection refused" in message or "network is unreachable" in message:
+        return "DB-NETWORK", "网络或端口不可达。请勿使用 Direct connection，改用 Transaction pooler。"
+    if sqlstate == "42501" or "permission denied" in message:
+        return "DB-PERMISSION", "数据库账号没有建表权限，请确认使用 Pooler 页面提供的 postgres.项目编号账号。"
+    if sqlstate.startswith("42") or "syntax error" in message:
+        return "DB-SCHEMA", "数据库已连通，但初始化 SQL 失败。请把这个诊断编号发给开发者。"
+    return "DB-UNKNOWN", "连接参数或 Supabase 项目状态异常。请核对页面上的四项安全检查。"
+
+
 def connect() -> DatabaseConnection:
     settings = postgres_settings()
     if settings:

@@ -10,7 +10,7 @@ from datetime import datetime
 import streamlit as st
 
 from ai_client import AIServiceError, provider_status, test_connection
-from db import database_backend, init_db, log_event
+from db import classify_database_error, database_backend, database_config_checks, init_db, log_event
 from services import (
     DIMENSION_LABELS,
     INTERVIEW_TYPES,
@@ -51,10 +51,17 @@ except RuntimeError as exc:
     st.error(f"数据库配置错误：{exc}")
     st.info("请检查 Streamlit Cloud 的 Supabase Secrets 是否完整，并确认使用 Transaction pooler 参数。")
     st.stop()
-except Exception:
+except Exception as exc:
     LOGGER.exception("Supabase database initialization failed")
-    st.error("云数据库暂时无法连接，请稍后重试。")
-    st.info("应用管理员可在 Streamlit Cloud 日志中查看具体原因。")
+    error_code, guidance = classify_database_error(exc)
+    st.error(f"云数据库连接失败（诊断编号：{error_code}）")
+    for label, passed in database_config_checks():
+        if passed:
+            st.success(f"{label}：正确")
+        else:
+            st.error(f"{label}：需要检查")
+    st.info(guidance)
+    st.caption("安全诊断不会显示 Host、User、密码或完整连接字符串。")
     st.stop()
 
 
