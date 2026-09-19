@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import db
 import services
+from ai_client import _parse_json
 
 
 class YanyanMvpTests(unittest.TestCase):
@@ -134,6 +135,10 @@ class YanyanMvpTests(unittest.TestCase):
         with patch.object(services, "analyze_interview_answer", side_effect=AssertionError("不应重复调用 API")):
             second = services.submit_answer(session_id, question["session_question_id"], answer)
         self.assertEqual(first["overall_score"], second["overall_score"])
+
+    def test_json_parser_accepts_code_fence_and_explanation(self) -> None:
+        payload = _parse_json('结果如下：\n```json\n{"ok": true}\n```')
+        self.assertIs(payload["ok"], True)
 
 
 if __name__ == "__main__":

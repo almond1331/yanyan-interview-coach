@@ -61,7 +61,7 @@ def test_connection() -> str:
     payload = complete_json(
         system_prompt='你是 API 连通性检查助手。只输出 JSON：{"ok":true}。',
         user_prompt='请返回 JSON：{"ok":true}。',
-        max_tokens=30,
+        max_tokens=128,
     )
     if payload.get("ok") is not True:
         raise AIServiceError("模型已响应，但连通性检查结果不符合预期。")
@@ -71,12 +71,25 @@ def test_connection() -> str:
 
 def _parse_json(content: str) -> dict[str, Any]:
     cleaned = content.strip()
+    if not cleaned:
+        raise AIServiceError("模型返回了空内容，请稍后重试。")
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*```$", "", cleaned)
     try:
         result = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        raise AIServiceError("模型返回的内容不是有效 JSON。") from exc
+    except json.JSONDecodeError:
+        result = None
+        decoder = json.JSONDecoder()
+        for position, character in enumerate(cleaned):
+            if character != "{":
+                continue
+            try:
+                result, _ = decoder.raw_decode(cleaned[position:])
+                break
+            except json.JSONDecodeError:
+                continue
+        if result is None:
+            raise AIServiceError("模型返回的内容不是有效 JSON，请重试。")
     if not isinstance(result, dict):
         raise AIServiceError("模型返回的 JSON 顶层必须是对象。")
     return result
@@ -97,6 +110,7 @@ def complete_json(system_prompt: str, user_prompt: str, max_tokens: int = 1200) 
                     {"role": "user", "content": user_prompt},
                 ],
                 "response_format": {"type": "json_object"},
+                "thinking": {"type": "disabled"},
                 "temperature": 0.3,
                 "max_tokens": max_tokens,
             },

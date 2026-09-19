@@ -40,6 +40,7 @@ py -m streamlit run app.py
 打开 `.streamlit/secrets.toml`，仅将 `DEEPSEEK_API_KEY` 替换为真实 Key。Base URL 必须写成纯文本网址，不能写成 Markdown 链接。`secrets.toml` 已被 `.gitignore` 忽略，禁止上传 GitHub。
 
 启动应用后，侧边栏应显示“DeepSeek 已配置”。点击“测试 AI 连接”可验证 Key、Base URL 和模型 ID；这会产生极少量 API 用量。
+结构化出题和评分会关闭模型思考模式，避免推理内容占用输出额度或截断 JSON；无效或空响应会触发明确错误并由业务层回退到规则模式。
 
 浏览器打开终端显示的地址，通常是 `http://localhost:8501`。
 
