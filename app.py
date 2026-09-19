@@ -23,8 +23,10 @@ from services import (
     DIMENSION_LABELS,
     INTERVIEW_TYPES,
     MAX_ANSWER_CHARS,
+    MAX_FILES_PER_CONFIG,
     MAX_UPLOAD_BYTES,
     UsageLimitError,
+    ai_usage_status,
     clear_visitor_data,
     create_session,
     dashboard_metrics,
@@ -36,6 +38,7 @@ from services import (
     list_questions,
     list_sessions,
     maybe_generate_followup,
+    remaining_material_capacity,
     save_material,
     submit_answer,
 )
@@ -196,6 +199,9 @@ def sidebar() -> str:
     ai_enabled, ai_message = provider_status()
     if ai_enabled:
         st.sidebar.success(ai_message)
+        usage = ai_usage_status(VISITOR_ID)
+        remaining = min(usage["visitor_remaining"], usage["global_remaining"])
+        st.sidebar.caption(f"今日 AI 剩余：{remaining} 次；用完后自动切换本地规则")
         app_env = str(st.secrets.get("APP_ENV", os.getenv("APP_ENV", "production"))).lower()
         if app_env == "development" and st.sidebar.button(
             "测试 AI 连接", icon=":material/wifi_tethering:", use_container_width=True
@@ -296,7 +302,7 @@ def config_dialog() -> None:
             key="config_material_type",
         )
         practice_files = st.file_uploader(
-            "练习资料（选填，可多选，单个最大 5MB）",
+            f"练习资料（选填，含简历最多 {MAX_FILES_PER_CONFIG} 个，单个最大 5MB）",
             type=["pdf", "docx", "txt", "md"],
             accept_multiple_files=True,
             key="config_materials",
@@ -319,9 +325,17 @@ def config_dialog() -> None:
         }
         if saved_resume or saved_materials:
             st.caption(f"已暂存 {int(bool(saved_resume)) + len(saved_materials)} 个文件，进入下一步后不会丢失。")
+        selected_file_count = int(bool(saved_resume)) + len(saved_materials)
+        if selected_file_count > MAX_FILES_PER_CONFIG:
+            st.error(f"一次配置最多上传 {MAX_FILES_PER_CONFIG} 个文件，请减少后继续。")
         _, right = st.columns([3, 1])
         with right:
-            if st.button("继续", type="primary", use_container_width=True, disabled=not major.strip()):
+            if st.button(
+                "继续",
+                type="primary",
+                use_container_width=True,
+                disabled=not major.strip() or selected_file_count > MAX_FILES_PER_CONFIG,
+            ):
                 st.session_state.config_step = 2
                 st.rerun()
     elif step == 2:
@@ -387,8 +401,12 @@ def config_dialog() -> None:
                 extra_requirement = preferences.get("extra_requirement", "")
                 resume = profile.get("resume")
                 uploads = ([resume] if resume else []) + list(practice_materials)
-                if any(uploaded["size"] > MAX_UPLOAD_BYTES for uploaded in uploads):
+                if len(uploads) > MAX_FILES_PER_CONFIG:
+                    st.error(f"一次配置最多上传 {MAX_FILES_PER_CONFIG} 个文件。")
+                elif any(uploaded["size"] > MAX_UPLOAD_BYTES for uploaded in uploads):
                     st.error("单个文件不能超过 5MB，请压缩后重试。")
+                elif len(uploads) > remaining_material_capacity(VISITOR_ID):
+                    st.error("当前匿名体验的资料空间不足，请在侧边栏清除旧数据或创建新体验。")
                 else:
                     try:
                         session_id = create_session(VISITOR_ID, mode, major, counts, extra_requirement)
@@ -667,15 +685,18 @@ def render_library() -> None:
             if uploaded.size > MAX_UPLOAD_BYTES:
                 st.error("文件超过 5MB。")
             else:
-                save_material(
-                    visitor_id=VISITOR_ID,
-                    session_id=None,
-                    material_type=material_type,
-                    file_name=uploaded.name,
-                    data=uploaded.getvalue(),
-                )
-                st.success("资料已上传，可用于后续抽题。")
-                st.rerun()
+                try:
+                    save_material(
+                        visitor_id=VISITOR_ID,
+                        session_id=None,
+                        material_type=material_type,
+                        file_name=uploaded.name,
+                        data=uploaded.getvalue(),
+                    )
+                    st.success("资料已上传，可用于后续抽题。")
+                    st.rerun()
+                except (UsageLimitError, ValueError) as exc:
+                    st.error(str(exc))
     tab_materials, tab_questions = st.tabs(["已上传资料", "系统题库"])
     with tab_materials:
         materials = list_materials(VISITOR_ID)
@@ -684,7 +705,7 @@ def render_library() -> None:
         for item in materials:
             with st.container(border=True):
                 c1, c2, c3 = st.columns([2, 1, 1])
-                c1.markdown(f"**{item['file_name']}**")
+                c1.write(item["file_name"])
                 c1.caption(f"{item['material_type']} · {item['uploaded_at']}")
                 c2.write(f"{round(item['file_size'] / 1024, 1)} KB")
                 c3.write("已解析" if item["parse_status"] == "success" else "已保存元数据")

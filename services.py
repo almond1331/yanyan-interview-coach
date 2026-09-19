@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import re
 import zipfile
 from collections import Counter
@@ -10,7 +11,7 @@ from typing import Any, Iterable
 from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo
 
-from ai_client import AIServiceError, analyze_interview_answer, generate_interview_question
+from ai_client import AIServiceError, analyze_interview_answer, generate_interview_question, provider_status
 from db import fetch_all, fetch_one, log_event, transaction
 
 
@@ -29,9 +30,16 @@ DIMENSION_LABELS = {
     "response_score": "临场反应",
 }
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+MAX_EXTRACTED_DOCUMENT_BYTES = 10 * 1024 * 1024
 MAX_ANSWER_CHARS = 3000
+MAX_FILES_PER_CONFIG = 3
+MAX_MATERIALS_PER_VISITOR = 20
 DAILY_SESSION_LIMIT = 3
 GLOBAL_DAILY_SESSION_LIMIT = 30
+AI_DAILY_CALL_LIMIT_PER_VISITOR = 20
+AI_DAILY_CALL_LIMIT_GLOBAL = 120
+ALLOWED_UPLOAD_SUFFIXES = {".pdf", ".docx", ".txt", ".md"}
+MATERIAL_TYPES = {"简历", "专业资料", "院校面试真题", "其他资料"}
 
 
 class UsageLimitError(ValueError):
@@ -58,6 +66,17 @@ def _sql_timestamp(value: datetime) -> str:
     return value.isoformat(sep=" ", timespec="seconds")
 
 
+def _clean_file_name(file_name: str) -> tuple[str, str]:
+    clean_name = Path(file_name.replace("\\", "/")).name
+    clean_name = re.sub(r"[\x00-\x1f\x7f]", "", clean_name).strip()
+    if not clean_name or len(clean_name) > 200:
+        raise ValueError("文件名不能为空，且不能超过 200 字")
+    suffix = Path(clean_name).suffix.lower()
+    if suffix not in ALLOWED_UPLOAD_SUFFIXES:
+        raise ValueError("仅支持 PDF、DOCX、TXT、MD 文件")
+    return clean_name, suffix
+
+
 def extract_text(file_name: str, data: bytes) -> tuple[str, str]:
     suffix = Path(file_name).suffix.lower()
     try:
@@ -65,7 +84,10 @@ def extract_text(file_name: str, data: bytes) -> tuple[str, str]:
             return data.decode("utf-8", errors="ignore")[:30000], "success"
         if suffix == ".docx":
             with zipfile.ZipFile(io.BytesIO(data)) as archive:
-                xml = archive.read("word/document.xml")
+                document = archive.getinfo("word/document.xml")
+                if document.file_size > MAX_EXTRACTED_DOCUMENT_BYTES:
+                    return "", "failed"
+                xml = archive.read(document)
             root = ET.fromstring(xml)
             text = "\n".join(node.text or "" for node in root.iter() if node.tag.endswith("}t"))
             return text[:30000], "success"
@@ -88,10 +110,19 @@ def save_material(
         raise ValueError("上传文件为空")
     if len(data) > MAX_UPLOAD_BYTES:
         raise ValueError("单个文件不能超过 5MB")
-    content_text, parse_status = extract_text(file_name, data)
+    if material_type not in MATERIAL_TYPES:
+        raise ValueError("无效的资料类型")
+    clean_name, suffix = _clean_file_name(file_name)
+    content_text, parse_status = extract_text(clean_name, data)
     with transaction() as conn:
         if session_id is not None:
             _owned_session(conn, session_id, visitor_id)
+        material_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM materials WHERE visitor_id=?",
+            (visitor_id,),
+        ).fetchone()["count"]
+        if int(material_count) >= MAX_MATERIALS_PER_VISITOR:
+            raise UsageLimitError("当前匿名体验最多保留 20 份资料，请先清除旧数据或创建新体验。")
         cursor = conn.execute(
             """
             INSERT INTO materials(
@@ -104,8 +135,8 @@ def save_material(
                 session_id,
                 visitor_id,
                 material_type,
-                Path(file_name).name,
-                Path(file_name).suffix.lower(),
+                clean_name,
+                suffix,
                 len(data),
                 content_text,
                 parse_status,
@@ -117,7 +148,7 @@ def save_material(
         visitor_id,
         session_id,
         "配置页" if session_id else "面试题库",
-        {"material_type": material_type, "file_name": file_name, "file_size": len(data)},
+        {"material_type": material_type, "file_name": clean_name, "file_size": len(data)},
     )
     return material_id
 
@@ -198,6 +229,77 @@ def _material_for_type(materials: list[Any], interview_type: str) -> Any | None:
     return None
 
 
+def _reserve_ai_call(conn: Any, visitor_id: str, session_id: int, task: str) -> bool:
+    day_start, day_end = _china_day_window()
+    if conn.backend == "postgres":
+        conn.execute("SELECT pg_advisory_xact_lock(989447322)").fetchone()
+    usage = conn.execute(
+        """
+        SELECT COUNT(*) AS global_used,
+               COALESCE(SUM(CASE WHEN visitor_id=? THEN 1 ELSE 0 END), 0) AS visitor_used
+        FROM event_logs
+        WHERE event_name='ai_request_reserved' AND created_at >= ? AND created_at < ?
+        """,
+        (visitor_id, _sql_timestamp(day_start), _sql_timestamp(day_end)),
+    ).fetchone()
+    visitor_used = int(usage["visitor_used"])
+    global_used = int(usage["global_used"])
+    limit_scope = None
+    if visitor_used >= AI_DAILY_CALL_LIMIT_PER_VISITOR:
+        limit_scope = "visitor"
+    elif global_used >= AI_DAILY_CALL_LIMIT_GLOBAL:
+        limit_scope = "global"
+    event_name = "ai_limit_reached" if limit_scope else "ai_request_reserved"
+    conn.execute(
+        """
+        INSERT INTO event_logs(session_id, visitor_id, event_name, page_name, event_params)
+        VALUES (?, ?, ?, 'AI 服务', ?)
+        """,
+        (session_id, visitor_id, event_name, json.dumps({"task": task, "scope": limit_scope}, ensure_ascii=False)),
+    )
+    return limit_scope is None
+
+
+def _ai_call_allowed(conn: Any, visitor_id: str, session_id: int, task: str) -> bool:
+    enabled, _ = provider_status()
+    if not enabled:
+        return False
+    if conn.backend == "postgres":
+        # Keep the advisory lock short; never hold it during the external API request.
+        with transaction() as budget_conn:
+            return _reserve_ai_call(budget_conn, visitor_id, session_id, task)
+    return _reserve_ai_call(conn, visitor_id, session_id, task)
+
+
+def ai_usage_status(visitor_id: str) -> dict[str, int]:
+    day_start, day_end = _china_day_window()
+    row = fetch_one(
+        """
+        SELECT COUNT(*) AS global_used,
+               COALESCE(SUM(CASE WHEN visitor_id=? THEN 1 ELSE 0 END), 0) AS visitor_used
+        FROM event_logs
+        WHERE event_name='ai_request_reserved' AND created_at >= ? AND created_at < ?
+        """,
+        (visitor_id, _sql_timestamp(day_start), _sql_timestamp(day_end)),
+    )
+    visitor_used = int(row["visitor_used"]) if row else 0
+    global_used = int(row["global_used"]) if row else 0
+    return {
+        "visitor_used": visitor_used,
+        "visitor_limit": AI_DAILY_CALL_LIMIT_PER_VISITOR,
+        "visitor_remaining": max(0, AI_DAILY_CALL_LIMIT_PER_VISITOR - visitor_used),
+        "global_used": global_used,
+        "global_limit": AI_DAILY_CALL_LIMIT_GLOBAL,
+        "global_remaining": max(0, AI_DAILY_CALL_LIMIT_GLOBAL - global_used),
+    }
+
+
+def remaining_material_capacity(visitor_id: str) -> int:
+    row = fetch_one("SELECT COUNT(*) AS count FROM materials WHERE visitor_id=?", (visitor_id,))
+    used = int(row["count"]) if row else 0
+    return max(0, MAX_MATERIALS_PER_VISITOR - used)
+
+
 def _material_question(material: Any, interview_type: str, index: int) -> str:
     source_text = (material["content_text"] or "").strip()
     lines = [
@@ -243,25 +345,33 @@ def generate_questions_from_materials(
         material = _material_for_type(materials, interview_type)
         if material:
             generation_method = "rule"
-            try:
-                question_text = generate_interview_question(
-                    interview_type=interview_type,
-                    material_type=material["material_type"],
-                    material_name=material["file_name"],
-                    material_text=material["content_text"] or material["file_name"],
-                    user_major=user_major,
-                    extra_requirement=extra_requirement,
-                )
-                generation_method = "deepseek"
-            except AIServiceError as exc:
-                question_text = _material_question(material, interview_type, index)
-                log_event(
-                    "ai_fallback_used",
-                    visitor_id,
-                    session_id,
-                    "抽题服务",
-                    {"task": "question_generation", "reason": str(exc)[:200]},
-                )
+            question_text = _material_question(material, interview_type, index)
+            if _ai_call_allowed(conn, visitor_id, session_id, "question_generation"):
+                try:
+                    question_text = generate_interview_question(
+                        interview_type=interview_type,
+                        material_type=material["material_type"],
+                        material_name=material["file_name"],
+                        material_text=material["content_text"] or material["file_name"],
+                        user_major=user_major,
+                        extra_requirement=extra_requirement,
+                    )
+                    generation_method = "deepseek"
+                except AIServiceError as exc:
+                    conn.execute(
+                        """
+                        INSERT INTO event_logs(session_id, visitor_id, event_name, page_name, event_params)
+                        VALUES (?, ?, 'ai_fallback_used', '抽题服务', ?)
+                        """,
+                        (
+                            session_id,
+                            visitor_id,
+                            json.dumps(
+                                {"task": "question_generation", "reason": str(exc)[:200]},
+                                ensure_ascii=False,
+                            ),
+                        ),
+                    )
             generated.append(
                 {
                     "interview_type": interview_type,
@@ -448,21 +558,24 @@ def submit_answer(
             "reference_structure": existing["reference_structure"],
             "evaluation_method": existing["evaluation_method"],
         }
-    try:
-        result = analyze_interview_answer(
-            question_text=question["question_text"],
-            answer_text=cleaned_answer,
-            interview_type=question["interview_type"],
-        )
-    except AIServiceError as exc:
-        result = evaluate_answer(answer_text, question["interview_type"])
-        log_event(
-            "ai_fallback_used",
-            visitor_id,
-            session_id,
-            "评分服务",
-            {"task": "answer_evaluation", "question_id": session_question_id, "reason": str(exc)[:200]},
-        )
+    result = evaluate_answer(answer_text, question["interview_type"])
+    with transaction() as conn:
+        ai_allowed = _ai_call_allowed(conn, visitor_id, session_id, "answer_evaluation")
+    if ai_allowed:
+        try:
+            result = analyze_interview_answer(
+                question_text=question["question_text"],
+                answer_text=cleaned_answer,
+                interview_type=question["interview_type"],
+            )
+        except AIServiceError as exc:
+            log_event(
+                "ai_fallback_used",
+                visitor_id,
+                session_id,
+                "评分服务",
+                {"task": "answer_evaluation", "question_id": session_question_id, "reason": str(exc)[:200]},
+            )
     with transaction() as conn:
         conn.execute(
             """
@@ -709,4 +822,18 @@ def clear_visitor_data(visitor_id: str) -> None:
     with transaction() as conn:
         conn.execute("DELETE FROM interview_sessions WHERE visitor_id=?", (visitor_id,))
         conn.execute("DELETE FROM materials WHERE visitor_id=?", (visitor_id,))
-        conn.execute("DELETE FROM event_logs WHERE visitor_id=?", (visitor_id,))
+        conn.execute(
+            """
+            DELETE FROM event_logs
+            WHERE visitor_id=? AND event_name NOT IN ('ai_request_reserved', 'ai_limit_reached')
+            """,
+            (visitor_id,),
+        )
+        conn.execute(
+            """
+            UPDATE event_logs
+            SET visitor_id='deleted', event_params='{"retained_for":"daily_cost_limit"}'
+            WHERE visitor_id=? AND event_name IN ('ai_request_reserved', 'ai_limit_reached')
+            """,
+            (visitor_id,),
+        )

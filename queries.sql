@@ -48,3 +48,12 @@ LEFT JOIN session_questions sq ON sq.source_material_id = m.material_id
 GROUP BY m.material_id
 ORDER BY used_question_count DESC;
 
+-- 7. 每日 AI 调用预算、限额和降级监控
+SELECT DATE(created_at) AS usage_date,
+       SUM(CASE WHEN event_name = 'ai_request_reserved' THEN 1 ELSE 0 END) AS ai_calls,
+       SUM(CASE WHEN event_name = 'ai_limit_reached' THEN 1 ELSE 0 END) AS limited_requests,
+       SUM(CASE WHEN event_name = 'ai_fallback_used' THEN 1 ELSE 0 END) AS failed_fallbacks
+FROM event_logs
+WHERE event_name IN ('ai_request_reserved', 'ai_limit_reached', 'ai_fallback_used')
+GROUP BY DATE(created_at)
+ORDER BY usage_date DESC;

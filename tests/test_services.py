@@ -108,7 +108,10 @@ class YanyanMvpTests(unittest.TestCase):
             file_name="简历.txt",
             data="我负责医学影像分割项目的数据清洗与消融实验。".encode("utf-8"),
         )
-        with patch.object(services, "generate_interview_question", return_value="你如何设计消融实验以验证各模块贡献？"):
+        with (
+            patch.object(services, "provider_status", return_value=(True, "DeepSeek 已配置")),
+            patch.object(services, "generate_interview_question", return_value="你如何设计消融实验以验证各模块贡献？"),
+        ):
             rows = services.generate_session_questions(session_id, self.VISITOR_A)
         self.assertEqual("deepseek", rows[0]["generation_method"])
         self.assertIn("消融实验", rows[0]["question_text"])
@@ -129,7 +132,10 @@ class YanyanMvpTests(unittest.TestCase):
             "reference_structure": "研究目标、个人职责、关键行动、实验结果、复盘。",
             "evaluation_method": "deepseek",
         }
-        with patch.object(services, "analyze_interview_answer", return_value=ai_result):
+        with (
+            patch.object(services, "provider_status", return_value=(True, "DeepSeek 已配置")),
+            patch.object(services, "analyze_interview_answer", return_value=ai_result),
+        ):
             result = services.submit_answer(session_id, question["session_question_id"], "我完成了实验。", self.VISITOR_A)
         report = services.get_report(session_id, self.VISITOR_A)
         self.assertEqual("deepseek", result["evaluation_method"])
@@ -177,6 +183,70 @@ class YanyanMvpTests(unittest.TestCase):
         with self.assertRaises(services.UsageLimitError):
             services.create_session(self.VISITOR_A, "行为面", "通用", {"行为面": 1}, "")
 
+    def test_ai_call_budget_limits_visitor_and_global_usage(self) -> None:
+        session_a = services.create_session(self.VISITOR_A, "科研面", "人工智能", {"科研面": 1}, "")
+        session_b = services.create_session(self.VISITOR_B, "科研面", "人工智能", {"科研面": 1}, "")
+        with (
+            patch.object(services, "AI_DAILY_CALL_LIMIT_PER_VISITOR", 1),
+            patch.object(services, "AI_DAILY_CALL_LIMIT_GLOBAL", 2),
+            db.transaction() as conn,
+        ):
+            self.assertTrue(services._reserve_ai_call(conn, self.VISITOR_A, session_a, "test"))
+            self.assertFalse(services._reserve_ai_call(conn, self.VISITOR_A, session_a, "test"))
+            self.assertTrue(services._reserve_ai_call(conn, self.VISITOR_B, session_b, "test"))
+            self.assertFalse(services._reserve_ai_call(conn, "visitor-c", session_b, "test"))
+
+        usage = services.ai_usage_status(self.VISITOR_A)
+        self.assertEqual(1, usage["visitor_used"])
+        events = db.fetch_all("SELECT event_name FROM event_logs ORDER BY event_id")
+        self.assertEqual(2, sum(row["event_name"] == "ai_request_reserved" for row in events))
+        self.assertEqual(2, sum(row["event_name"] == "ai_limit_reached" for row in events))
+
+    def test_ai_limit_falls_back_without_interrupting_interview(self) -> None:
+        session_id = services.create_session(self.VISITOR_A, "科研面", "人工智能", {"科研面": 2}, "")
+        services.save_material(
+            visitor_id=self.VISITOR_A,
+            session_id=session_id,
+            material_type="简历",
+            file_name="resume.txt",
+            data=b"research project experience",
+        )
+        with (
+            patch.object(services, "provider_status", return_value=(True, "DeepSeek 已配置")),
+            patch.object(services, "AI_DAILY_CALL_LIMIT_PER_VISITOR", 1),
+            patch.object(services, "generate_interview_question", return_value="请介绍你的研究贡献和验证方法？") as generate,
+        ):
+            rows = services.generate_session_questions(session_id, self.VISITOR_A)
+
+        self.assertEqual(1, generate.call_count)
+        self.assertEqual(["deepseek", "rule"], [row["generation_method"] for row in rows])
+
+    def test_upload_type_name_and_material_limit_are_enforced(self) -> None:
+        with self.assertRaisesRegex(ValueError, "仅支持"):
+            services.save_material(
+                visitor_id=self.VISITOR_A,
+                session_id=None,
+                material_type="专业资料",
+                file_name="unsafe.exe",
+                data=b"content",
+            )
+        with patch.object(services, "MAX_MATERIALS_PER_VISITOR", 1):
+            services.save_material(
+                visitor_id=self.VISITOR_A,
+                session_id=None,
+                material_type="专业资料",
+                file_name="../../safe.txt",
+                data=b"content",
+            )
+            self.assertEqual("safe.txt", services.list_materials(self.VISITOR_A)[0]["file_name"])
+            with self.assertRaises(services.UsageLimitError):
+                services.save_material(
+                    visitor_id=self.VISITOR_A,
+                    session_id=None,
+                    material_type="专业资料",
+                    file_name="second.txt",
+                    data=b"content",
+                )
     def test_large_upload_and_long_answer_are_rejected(self) -> None:
         with self.assertRaises(ValueError):
             services.save_material(
@@ -202,6 +272,18 @@ class YanyanMvpTests(unittest.TestCase):
         services.clear_visitor_data(self.VISITOR_A)
         self.assertEqual([], services.list_sessions(self.VISITOR_A))
         self.assertEqual(1, len(services.list_sessions(self.VISITOR_B)))
+
+    def test_clear_data_anonymizes_but_retains_global_ai_budget(self) -> None:
+        session_id = services.create_session(self.VISITOR_A, "行为面", "通用", {"行为面": 1}, "")
+        with db.transaction() as conn:
+            self.assertTrue(services._reserve_ai_call(conn, self.VISITOR_A, session_id, "test"))
+        services.clear_visitor_data(self.VISITOR_A)
+
+        row = db.fetch_one("SELECT * FROM event_logs WHERE event_name='ai_request_reserved'")
+        self.assertEqual("deleted", row["visitor_id"])
+        self.assertIsNone(row["session_id"])
+        self.assertNotIn(self.VISITOR_A, row["event_params"])
+        self.assertEqual(1, services.ai_usage_status(self.VISITOR_B)["global_used"])
 
     def test_legacy_rows_are_not_exposed(self) -> None:
         with db.transaction() as conn:
