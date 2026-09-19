@@ -269,6 +269,40 @@ class YanyanMvpTests(unittest.TestCase):
         self.assertEqual("DB-AUTH", db.classify_database_error(auth_error)[0])
         self.assertEqual("DB-TIMEOUT", db.classify_database_error(timeout_error)[0])
 
+        wrapped_error = db.CloudDatabaseError("连接数据库", auth_error)
+        self.assertEqual("连接数据库", wrapped_error.phase)
+        self.assertEqual("DB-AUTH", db.classify_database_error(wrapped_error)[0])
+
+    def test_database_error_details_hide_connection_secrets(self) -> None:
+        settings = {
+            "SUPABASE_DB_HOST": "aws-0-region.pooler.supabase.com",
+            "SUPABASE_DB_PORT": "6543",
+            "SUPABASE_DB_NAME": "postgres",
+            "SUPABASE_DB_USER": "postgres.project-ref",
+            "SUPABASE_DB_PASSWORD": "secret-password",
+        }
+
+        class DiagnosticError(RuntimeError):
+            sqlstate = "08006"
+
+        cause = DiagnosticError(
+            "connection to 192.0.2.10 failed: "
+            "host=aws-0-region.pooler.supabase.com "
+            "user=postgres.project-ref password=secret-password "
+            "postgresql://postgres.project-ref:secret-password@aws-0-region.pooler.supabase.com/postgres"
+        )
+        with patch.dict(os.environ, settings, clear=False):
+            error_type, sqlstate, message = db.safe_database_error_details(
+                db.CloudDatabaseError("连接数据库", cause)
+            )
+
+        self.assertEqual("DiagnosticError", error_type)
+        self.assertEqual("08006", sqlstate)
+        self.assertIn("[IP]", message)
+        self.assertNotIn(settings["SUPABASE_DB_HOST"], message)
+        self.assertNotIn(settings["SUPABASE_DB_USER"], message)
+        self.assertNotIn(settings["SUPABASE_DB_PASSWORD"], message)
+
     def test_json_parser_accepts_code_fence_and_explanation(self) -> None:
         payload = _parse_json('结果如下：\n```json\n{"ok": true}\n```')
         self.assertIs(payload["ok"], True)

@@ -10,7 +10,15 @@ from datetime import datetime
 import streamlit as st
 
 from ai_client import AIServiceError, provider_status, test_connection
-from db import classify_database_error, database_backend, database_config_checks, init_db, log_event
+from db import (
+    CloudDatabaseError,
+    classify_database_error,
+    database_backend,
+    database_config_checks,
+    init_db,
+    log_event,
+    safe_database_error_details,
+)
 from services import (
     DIMENSION_LABELS,
     INTERVIEW_TYPES,
@@ -50,6 +58,15 @@ try:
 except RuntimeError as exc:
     st.error(f"数据库配置错误：{exc}")
     st.info("请检查 Streamlit Cloud 的 Supabase Secrets 是否完整，并确认使用 Transaction pooler 参数。")
+    st.stop()
+except CloudDatabaseError as exc:
+    LOGGER.exception("Supabase database initialization failed")
+    error_code, guidance = classify_database_error(exc.cause)
+    error_type, sqlstate, safe_message = safe_database_error_details(exc)
+    st.error(f"云数据库失败（阶段：{exc.phase}；诊断编号：{error_code}）")
+    st.code(f"异常类型：{error_type}\nSQLSTATE：{sqlstate}\n脱敏原因：{safe_message}")
+    st.info(guidance)
+    st.caption("诊断内容已自动遮住 Host、User、密码、IP 和完整连接字符串。")
     st.stop()
 except Exception as exc:
     LOGGER.exception("Supabase database initialization failed")

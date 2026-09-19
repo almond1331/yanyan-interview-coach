@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -64,6 +65,13 @@ class PostgresSettings:
     dbname: str
     user: str
     password: str
+
+
+class CloudDatabaseError(Exception):
+    def __init__(self, phase: str, cause: Exception) -> None:
+        super().__init__(phase)
+        self.phase = phase
+        self.cause = cause
 
 
 def _secret(name: str) -> str:
@@ -154,6 +162,8 @@ def database_config_checks() -> list[tuple[str, bool]]:
 
 
 def classify_database_error(exc: Exception) -> tuple[str, str]:
+    if isinstance(exc, CloudDatabaseError):
+        exc = exc.cause
     sqlstate = str(getattr(exc, "sqlstate", "") or "")
     message = str(exc).lower()
     if sqlstate in {"28P01", "28000"} or "password authentication failed" in message:
@@ -171,6 +181,27 @@ def classify_database_error(exc: Exception) -> tuple[str, str]:
     if sqlstate.startswith("42") or "syntax error" in message:
         return "DB-SCHEMA", "数据库已连通，但初始化 SQL 失败。请把这个诊断编号发给开发者。"
     return "DB-UNKNOWN", "连接参数或 Supabase 项目状态异常。请核对页面上的四项安全检查。"
+
+
+def safe_database_error_details(exc: Exception) -> tuple[str, str, str]:
+    root = exc.cause if isinstance(exc, CloudDatabaseError) else exc
+    error_type = type(root).__name__
+    sqlstate = str(getattr(root, "sqlstate", "") or "无")
+    message = str(root)
+    settings = postgres_settings()
+    if settings:
+        for secret_value, replacement in (
+            (settings.password, "[PASSWORD]"),
+            (settings.host, "[HOST]"),
+            (settings.user, "[USER]"),
+        ):
+            if secret_value:
+                message = message.replace(secret_value, replacement)
+    message = re.sub(r"postgres(?:ql)?://\S+", "[CONNECTION_STRING]", message, flags=re.IGNORECASE)
+    message = re.sub(r"password\s*=\s*\S+", "password=[PASSWORD]", message, flags=re.IGNORECASE)
+    message = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "[IP]", message)
+    message = " ".join(message.split())
+    return error_type, sqlstate, (message[:500] or "无详细信息")
 
 
 def connect() -> DatabaseConnection:
@@ -230,40 +261,51 @@ def _seed_questions(conn: DatabaseConnection) -> None:
 
 
 def init_db() -> None:
-    with transaction() as conn:
-        if conn.backend == "postgres":
-            conn.execute("SELECT pg_advisory_xact_lock(989447321)").fetchone()
-            conn.executescript(POSTGRES_SCHEMA_PATH.read_text(encoding="utf-8"))
-            _seed_questions(conn)
-            return
+    settings = postgres_settings()
+    try:
+        with transaction() as conn:
+            if conn.backend == "postgres":
+                try:
+                    conn.execute("SELECT pg_advisory_xact_lock(989447321)").fetchone()
+                    conn.executescript(POSTGRES_SCHEMA_PATH.read_text(encoding="utf-8"))
+                    _seed_questions(conn)
+                except Exception as exc:
+                    raise CloudDatabaseError("初始化数据表", exc) from exc
+                return
 
-        conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-        for table_name in ("interview_sessions", "materials", "event_logs"):
-            table_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
-            if "visitor_id" not in table_columns:
-                conn.execute(
-                    f"ALTER TABLE {table_name} ADD COLUMN visitor_id TEXT NOT NULL DEFAULT 'legacy'"
-                )
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(session_questions)")}
-        if "parent_session_question_id" not in columns:
-            conn.execute("ALTER TABLE session_questions ADD COLUMN parent_session_question_id INTEGER")
-        if "generation_method" not in columns:
-            conn.execute("ALTER TABLE session_questions ADD COLUMN generation_method TEXT NOT NULL DEFAULT 'rule'")
-        answer_columns = {row[1] for row in conn.execute("PRAGMA table_info(answers)")}
-        if "evaluation_method" not in answer_columns:
-            conn.execute("ALTER TABLE answers ADD COLUMN evaluation_method TEXT NOT NULL DEFAULT 'rule'")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_visitor_created "
-            "ON interview_sessions(visitor_id, created_at DESC)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_materials_visitor ON materials(visitor_id, uploaded_at DESC)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_visitor_time "
-            "ON event_logs(visitor_id, created_at DESC)"
-        )
-        _seed_questions(conn)
+            conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+            for table_name in ("interview_sessions", "materials", "event_logs"):
+                table_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+                if "visitor_id" not in table_columns:
+                    conn.execute(
+                        f"ALTER TABLE {table_name} ADD COLUMN visitor_id TEXT NOT NULL DEFAULT 'legacy'"
+                    )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(session_questions)")}
+            if "parent_session_question_id" not in columns:
+                conn.execute("ALTER TABLE session_questions ADD COLUMN parent_session_question_id INTEGER")
+            if "generation_method" not in columns:
+                conn.execute("ALTER TABLE session_questions ADD COLUMN generation_method TEXT NOT NULL DEFAULT 'rule'")
+            answer_columns = {row[1] for row in conn.execute("PRAGMA table_info(answers)")}
+            if "evaluation_method" not in answer_columns:
+                conn.execute("ALTER TABLE answers ADD COLUMN evaluation_method TEXT NOT NULL DEFAULT 'rule'")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_visitor_created "
+                "ON interview_sessions(visitor_id, created_at DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_materials_visitor ON materials(visitor_id, uploaded_at DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_visitor_time "
+                "ON event_logs(visitor_id, created_at DESC)"
+            )
+            _seed_questions(conn)
+    except CloudDatabaseError:
+        raise
+    except Exception as exc:
+        if settings:
+            raise CloudDatabaseError("连接数据库", exc) from exc
+        raise
 
 
 def fetch_all(sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
