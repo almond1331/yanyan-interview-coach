@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime
 
 import streamlit as st
+import services as services_module
 
 from ai_client import AIServiceError, provider_status, test_connection
 from db import (
@@ -24,7 +25,6 @@ from services import (
     INTERVIEW_TYPES,
     MAX_ANSWER_CHARS,
     MAX_FILES_PER_CONFIG,
-    MAX_FEEDBACK_CHARS,
     MAX_UPLOAD_BYTES,
     UsageLimitError,
     ai_usage_status,
@@ -34,7 +34,6 @@ from services import (
     finish_session,
     generate_session_questions,
     get_report,
-    get_session_feedback,
     get_session_questions,
     list_materials,
     list_questions,
@@ -42,7 +41,6 @@ from services import (
     maybe_generate_followup,
     remaining_material_capacity,
     save_material,
-    save_session_feedback,
     submit_answer,
 )
 
@@ -639,43 +637,7 @@ def render_report(session_id: int) -> None:
         f'<div class="training-band"><h3 style="color:white">训练计划</h3><b>本轮总体表现</b><p>已完成 {summary["answered_questions"]} / {summary["total_questions"]} 题，综合评分 {summary["overall_score"] or 0}。</p><b>薄弱项</b><p>{"、".join(weaknesses[:3])}</p><b>总结</b><p>保持结论先行，并用具体行动和结果支撑判断。</p><b>下一轮训练建议</b><p>围绕“{weaknesses[0]}”完成一轮专项练习；每题回答后检查是否包含结论、证据和反思。</p></div>',
         unsafe_allow_html=True,
     )
-    st.subheader("体验反馈")
-    saved_feedback = get_session_feedback(session_id, VISITOR_ID)
-    if saved_feedback:
-        st.caption("你已提交过反馈，可以修改后再次保存。")
-    helpful_default = int(saved_feedback["helpful_score"]) if saved_feedback else 4
-    relevance_default = int(saved_feedback["relevance_score"]) if saved_feedback else 4
-    comment_default = saved_feedback["comment"] if saved_feedback else ""
-    with st.form(f"report_feedback_{session_id}"):
-        feedback_left, feedback_right = st.columns(2)
-        helpful_score = feedback_left.select_slider(
-            "这份报告对你有帮助吗？",
-            options=[1, 2, 3, 4, 5],
-            value=helpful_default,
-        )
-        relevance_score = feedback_right.select_slider(
-            "本轮题目贴合你的需求吗？",
-            options=[1, 2, 3, 4, 5],
-            value=relevance_default,
-        )
-        feedback_comment = st.text_area(
-            "你最希望我们改进什么？（选填）",
-            value=comment_default,
-            max_chars=MAX_FEEDBACK_CHARS,
-            placeholder="例如：专业题希望更贴近目标院校，评分建议希望更具体。",
-        )
-        if st.form_submit_button("提交反馈", icon=":material/rate_review:"):
-            try:
-                save_session_feedback(
-                    session_id,
-                    VISITOR_ID,
-                    int(helpful_score),
-                    int(relevance_score),
-                    feedback_comment,
-                )
-                st.success("反馈已保存，感谢你的建议。")
-            except ValueError as exc:
-                st.error(str(exc))
+    render_report_feedback(session_id)
     st.write("")
     left, right = st.columns([1, 4])
     if left.button("返回大厅", icon=":material/home:", use_container_width=True):
@@ -687,6 +649,48 @@ def render_report(session_id: int) -> None:
         start_config(title if title in INTERVIEW_TYPES else "全流程面试")
         st.session_state.report_session_id = None
         st.rerun()
+
+
+def render_report_feedback(session_id: int) -> None:
+    get_feedback = getattr(services_module, "get_session_feedback", None)
+    save_feedback = getattr(services_module, "save_session_feedback", None)
+    if not callable(get_feedback) or not callable(save_feedback):
+        LOGGER.warning("Report feedback service is not available in the loaded services module")
+        return
+
+    st.subheader("体验反馈")
+    saved_feedback = get_feedback(session_id, VISITOR_ID)
+    if saved_feedback:
+        st.caption("你已提交过反馈，可以修改后再次保存。")
+    helpful_default = int(saved_feedback["helpful_score"]) if saved_feedback else 4
+    relevance_default = int(saved_feedback["relevance_score"]) if saved_feedback else 4
+    comment_default = saved_feedback["comment"] if saved_feedback else ""
+    with st.form(f"report_feedback_{session_id}"):
+        feedback_left, feedback_right = st.columns(2)
+        helpful_score = feedback_left.select_slider(
+            "这份报告对你有帮助吗？", options=[1, 2, 3, 4, 5], value=helpful_default
+        )
+        relevance_score = feedback_right.select_slider(
+            "本轮题目贴合你的需求吗？", options=[1, 2, 3, 4, 5], value=relevance_default
+        )
+        feedback_comment = st.text_area(
+            "你最希望我们改进什么？（选填）",
+            value=comment_default,
+            max_chars=int(getattr(services_module, "MAX_FEEDBACK_CHARS", 500)),
+            placeholder="例如：专业题希望更贴近目标院校，评分建议希望更具体。",
+        )
+        if st.form_submit_button("提交反馈", icon=":material/rate_review:"):
+            try:
+                save_feedback(
+                    session_id,
+                    VISITOR_ID,
+                    int(helpful_score),
+                    int(relevance_score),
+                    feedback_comment,
+                )
+                st.success("反馈已保存，感谢你的建议。")
+            except ValueError as exc:
+                st.error(str(exc))
 
 
 def render_history() -> None:
