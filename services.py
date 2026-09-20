@@ -47,6 +47,16 @@ class UsageLimitError(ValueError):
     pass
 
 
+def merge_transcript(current_answer: str, transcript: str) -> tuple[str, bool]:
+    current = current_answer.strip()
+    addition = transcript.strip()
+    if not addition or current.endswith(addition):
+        return current[:MAX_ANSWER_CHARS], len(current) > MAX_ANSWER_CHARS
+    separator = " " if current else ""
+    merged = f"{current}{separator}{addition}"
+    return merged[:MAX_ANSWER_CHARS], len(merged) > MAX_ANSWER_CHARS
+
+
 def _owned_session(conn: Any, session_id: int, visitor_id: str) -> Any:
     session = conn.execute(
         "SELECT * FROM interview_sessions WHERE session_id = ? AND visitor_id = ?",

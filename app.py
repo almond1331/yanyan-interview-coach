@@ -13,6 +13,11 @@ import streamlit as st
 import streamlit.components.v1 as components
 import services as services_module
 
+try:
+    from streamlit_mic_recorder import speech_to_text
+except ImportError:
+    speech_to_text = None
+
 from ai_client import provider_status
 from db import (
     CloudDatabaseError,
@@ -39,6 +44,7 @@ from services import (
     list_materials,
     list_questions,
     list_sessions,
+    merge_transcript,
     maybe_generate_followup,
     remaining_material_capacity,
     save_material,
@@ -169,7 +175,6 @@ def init_state() -> None:
         "active_session_id": None,
         "current_question_index": 0,
         "show_dialog": False,
-        "mic_on": True,
         "camera_on": False,
         "report_session_id": None,
         "nav_target": None,
@@ -219,7 +224,7 @@ def sidebar() -> str:
     st.sidebar.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
     with st.sidebar.expander("设置与隐私", icon=":material/settings:"):
         st.markdown(
-            '<div class="sidebar-note">请勿上传身份证、电话等敏感信息。完整匿名链接可用于返回当前历史，请不要公开分享。</div>',
+            '<div class="sidebar-note">请勿上传身份证、电话等敏感信息。语音输入会将录音临时发送给 Google 语音识别服务，应用仅保存转写文字。完整匿名链接可用于返回当前历史，请不要公开分享。</div>',
             unsafe_allow_html=True,
         )
         if st.button("创建全新匿名体验", icon=":material/person_add:", use_container_width=True):
@@ -378,9 +383,9 @@ def config_dialog() -> None:
                 st.rerun()
     else:
         st.subheader("检查面试设备")
-        st.caption("MVP 使用文字作答，以下为模拟设备检查，不会采集音视频。")
+        st.caption("进入面试后可选择语音转文字或键盘输入；摄像头仍为模拟开关，不采集视频。")
         c1, c2 = st.columns(2)
-        c1.success("麦克风状态：模拟检测正常")
+        c1.info("麦克风：首次使用时浏览器会请求权限")
         c2.info("摄像头状态：可选，不影响文字练习")
         camera = st.toggle("模拟开启摄像头", value=False, key="config_camera")
         mode = st.session_state.selected_mode
@@ -592,19 +597,41 @@ def render_interview(session_id: int) -> None:
         render_question_audio(questions[index], autoplay)
         st.caption("浏览器若阻止首次自动朗读，请点击“播放题目”。声音由本机浏览器生成，不消耗 AI 额度。")
         answer_key = f"answer_{session_id}_{questions[index]['session_question_id']}"
+        if callable(speech_to_text):
+            transcript = speech_to_text(
+                start_prompt="开始语音输入",
+                stop_prompt="结束并转文字",
+                language="en-US" if questions[index]["interview_type"] == "英语面" else "zh-CN",
+                just_once=True,
+                use_container_width=True,
+                key=f"speech_{session_id}_{question_id}",
+            )
+            if transcript:
+                merged_answer, was_truncated = merge_transcript(
+                    str(st.session_state.get(answer_key, "")), transcript
+                )
+                if was_truncated:
+                    st.warning("转写结果超过回答长度上限，已保留前 3000 字。")
+                st.session_state[answer_key] = merged_answer
+                log_event(
+                    "speech_transcription_success",
+                    VISITOR_ID,
+                    session_id,
+                    "模拟面试",
+                    {"question_id": question_id, "transcript_chars": len(transcript)},
+                )
+                st.toast("语音已转为文字，可继续编辑")
+            st.caption("语音转写由 Google Speech Recognition 提供；录音不写入本产品数据库。")
+        else:
+            st.caption("语音输入暂不可用，仍可直接输入文字回答。")
         st.text_area(
-            "输入你的回答",
+            "回答文字",
             key=answer_key,
             height=150,
             max_chars=MAX_ANSWER_CHARS,
-            placeholder="完成思考后，在这里输入文字回答……",
+            placeholder="使用语音转写，或直接在这里输入回答……",
         )
-        mic_col, camera_col, dialog_col, done_col, end_col = st.columns([.65, .65, .65, 1.2, 1.7])
-        with mic_col:
-            if st.button("麦克风", icon=":material/mic:" if st.session_state.mic_on else ":material/mic_off:", use_container_width=True):
-                st.session_state.mic_on = not st.session_state.mic_on
-                log_event("mic_click", VISITOR_ID, session_id, "模拟面试", {"enabled": st.session_state.mic_on})
-                st.rerun()
+        camera_col, dialog_col, done_col, end_col = st.columns([.75, .75, 1.2, 1.7])
         with camera_col:
             if st.button("摄像头", icon=":material/videocam:" if st.session_state.camera_on else ":material/videocam_off:", use_container_width=True):
                 st.session_state.camera_on = not st.session_state.camera_on

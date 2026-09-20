@@ -325,6 +325,21 @@ class YanyanMvpTests(unittest.TestCase):
                 self.VISITOR_A,
             )
 
+    def test_speech_transcript_merge_appends_deduplicates_and_truncates(self) -> None:
+        merged, truncated = services.merge_transcript("首先说明背景。", "其次介绍行动。")
+        self.assertEqual("首先说明背景。 其次介绍行动。", merged)
+        self.assertFalse(truncated)
+
+        duplicate, truncated = services.merge_transcript(merged, "其次介绍行动。")
+        self.assertEqual(merged, duplicate)
+        self.assertFalse(truncated)
+
+        oversized, truncated = services.merge_transcript(
+            "答" * (services.MAX_ANSWER_CHARS - 1), "补充内容"
+        )
+        self.assertEqual(services.MAX_ANSWER_CHARS, len(oversized))
+        self.assertTrue(truncated)
+
     def test_clear_data_only_removes_current_visitor(self) -> None:
         session_a = services.create_session(self.VISITOR_A, "行为面", "通用", {"行为面": 1}, "")
         services.create_session(self.VISITOR_B, "行为面", "通用", {"行为面": 1}, "")
