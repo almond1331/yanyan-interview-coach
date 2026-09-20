@@ -4,7 +4,6 @@ import base64
 import html
 import hashlib
 import logging
-import os
 import re
 import uuid
 from datetime import datetime
@@ -14,7 +13,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import services as services_module
 
-from ai_client import AIServiceError, provider_status, test_connection
+from ai_client import provider_status
 from db import (
     CloudDatabaseError,
     classify_database_error,
@@ -31,7 +30,6 @@ from services import (
     MAX_FILES_PER_CONFIG,
     MAX_UPLOAD_BYTES,
     UsageLimitError,
-    ai_usage_status,
     clear_visitor_data,
     create_session,
     dashboard_metrics,
@@ -103,18 +101,24 @@ def apply_styles() -> None:
         <style>
         :root { --blue:#2563eb; --navy:#17365f; --pale:#f3f7ff; --line:#dce5f2; --muted:#64748b; }
         .stApp { background:#f5f8fd; color:#17365f; }
+        header[data-testid="stHeader"] { background:rgba(245,248,253,.96); }
         [data-testid="stSidebar"] { background:#ffffff; border-right:1px solid #e5ebf4; }
+        [data-testid="stSidebarUserContent"] { padding-top:2rem; }
         [data-testid="stSidebar"] .stRadio label { padding:.65rem .75rem; border-radius:8px; }
         [data-testid="stSidebar"] .stRadio label:has(input:checked) { background:#eaf2ff; color:#1d5eea; }
-        .block-container { padding-top:2rem; max-width:1440px; }
-        h1,h2,h3 { color:#17365f; letter-spacing:0 !important; }
+        .block-container { padding-top:4.75rem !important; padding-bottom:3rem; max-width:1440px; }
+        .block-container [data-testid="stVerticalBlock"] { gap:.8rem; }
+        h1,h2,h3 { color:#17365f; letter-spacing:0 !important; margin-top:.2rem !important; margin-bottom:.45rem !important; }
+        h1 { font-size:2.35rem !important; line-height:1.15 !important; }
+        h2 { font-size:1.65rem !important; line-height:1.2 !important; }
+        h3 { font-size:1.22rem !important; line-height:1.25 !important; }
         .eyebrow { color:#2563eb; font-weight:700; font-size:.9rem; margin-bottom:.3rem; }
         .subtle { color:#64748b; }
-        .brand { display:flex; align-items:center; gap:.7rem; font-size:1.45rem; font-weight:800; color:#2563eb; margin:.25rem 0 1.7rem; }
+        .brand { display:flex; align-items:center; gap:.7rem; font-size:1.45rem; font-weight:800; color:#2563eb; margin:.25rem 0 1.35rem; }
         .brandmark { width:42px; height:42px; border-radius:8px; display:grid; place-items:center; color:white; background:#2563eb; }
         .mode-card { background:white; border:1px solid #dce5f2; border-radius:8px; padding:1.1rem; min-height:156px; }
         .mode-top { height:46px; border-radius:6px; display:flex; align-items:center; padding:0 .8rem; color:white; font-weight:800; margin-bottom:1rem; }
-        .metric-card { background:white; border:1px solid #dce5f2; border-radius:8px; padding:1rem 1.1rem; min-height:110px; }
+        .metric-card { background:white; border:1px solid #dce5f2; border-radius:8px; padding:.85rem 1rem; min-height:92px; }
         .metric-label { color:#64748b; font-size:.86rem; }
         .metric-value { color:#17365f; font-size:1.9rem; font-weight:800; margin-top:.45rem; }
         .stepbar { display:flex; gap:.5rem; margin-bottom:1.2rem; }
@@ -133,12 +137,21 @@ def apply_styles() -> None:
         .chat-ai { background:#eef3fa; }
         .chat-user { background:#2563eb; color:white; margin-left:12%; }
         .source-badge { display:inline-block; padding:.16rem .5rem; border-radius:999px; background:#eaf2ff; color:#2563eb; font-size:.78rem; }
-        .score { font-size:3rem; font-weight:850; color:#2563eb; line-height:1; }
-        .training-band { color:white; background:#173f72; border-radius:8px; padding:1.3rem 1.5rem; }
+        .score { font-size:2.55rem; font-weight:850; color:#2563eb; line-height:1; }
+        .training-band { color:white; background:#173f72; border-radius:8px; padding:1rem 1.25rem; }
+        .training-band p { margin:.25rem 0 .65rem; }
+        .sidebar-note { color:#64748b; font-size:.82rem; line-height:1.55; margin:.65rem .15rem; }
+        .sidebar-divider { height:1px; background:#e5ebf4; margin:1rem 0 .5rem; }
         div[data-testid="stButton"] button { border-radius:7px; min-height:2.65rem; font-weight:650; }
         div[data-testid="stFileUploader"] { background:white; border-radius:8px; }
         div[data-testid="stExpander"] { background:white; border-radius:8px; border-color:#dce5f2; }
-        @media (max-width: 760px) { .block-container { padding:1rem; } .mode-card { min-height:auto; } .score { font-size:2.3rem; } }
+        @media (max-width: 760px) {
+          .block-container { padding:4rem 1rem 2rem !important; }
+          h1 { font-size:1.9rem !important; }
+          h2 { font-size:1.45rem !important; }
+          .mode-card { min-height:auto; }
+          .score { font-size:2.2rem; }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -203,33 +216,12 @@ def sidebar() -> str:
     if target in options:
         st.session_state.sidebar_nav = target
     current = st.sidebar.radio("导航", options, key="sidebar_nav", label_visibility="collapsed")
-    st.sidebar.caption("保研 AI 面试助手 · MVP")
-    if DATABASE_BACKEND == "postgres":
-        st.sidebar.caption("数据存储：Supabase 云数据库")
-    else:
-        st.sidebar.caption("数据存储：本地 SQLite")
-    ai_enabled, ai_message = provider_status()
-    if ai_enabled:
-        st.sidebar.success(ai_message)
-        usage = ai_usage_status(VISITOR_ID)
-        remaining = min(usage["visitor_remaining"], usage["global_remaining"])
-        st.sidebar.caption(f"今日 AI 剩余：{remaining} 次；用完后自动切换本地规则")
-        app_env = str(st.secrets.get("APP_ENV", os.getenv("APP_ENV", "production"))).lower()
-        if app_env == "development" and st.sidebar.button(
-            "测试 AI 连接", icon=":material/wifi_tethering:", use_container_width=True
-        ):
-            try:
-                with st.spinner("正在连接 DeepSeek……"):
-                    message = test_connection()
-                st.sidebar.success(message)
-            except AIServiceError as exc:
-                st.sidebar.error(str(exc))
-    else:
-        st.sidebar.info(ai_message)
-    st.sidebar.caption(f"匿名体验编号：{VISITOR_ID[-6:]}")
-    st.sidebar.caption("历史属于当前带 visitor 参数的匿名链接。把完整网址发给别人，也会同时分享这份历史。")
-    with st.sidebar.expander("隐私与数据"):
-        st.caption("资料文本和回答会发送给 DeepSeek 用于出题与反馈。请勿上传身份证、电话等敏感信息。")
+    st.sidebar.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
+    with st.sidebar.expander("设置与隐私", icon=":material/settings:"):
+        st.markdown(
+            '<div class="sidebar-note">请勿上传身份证、电话等敏感信息。完整匿名链接可用于返回当前历史，请不要公开分享。</div>',
+            unsafe_allow_html=True,
+        )
         if st.button("创建全新匿名体验", icon=":material/person_add:", use_container_width=True):
             new_visitor_id = uuid.uuid4().hex
             st.session_state.visitor_id = new_visitor_id
@@ -244,9 +236,8 @@ def sidebar() -> str:
             ):
                 st.session_state.pop(key, None)
             st.rerun()
-        st.caption("新体验不会删除旧数据；保存旧的完整网址，仍可返回原历史。")
-        confirm_clear = st.checkbox("我确认清除当前匿名访客的全部数据", key="confirm_clear_data")
-        if st.button("清除我的数据", disabled=not confirm_clear, use_container_width=True):
+        confirm_clear = st.checkbox("确认清除当前体验数据", key="confirm_clear_data")
+        if st.button("清除当前数据", disabled=not confirm_clear, use_container_width=True):
             clear_visitor_data(VISITOR_ID)
             for key in ("active_session_id", "report_session_id", "show_config"):
                 st.session_state[key] = None if key != "show_config" else False
