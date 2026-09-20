@@ -103,8 +103,9 @@ SUPABASE_DB_PASSWORD = "数据库密码"
 - 所有实际题目都会写入 `session_questions`，并记录 `source_scope`、`source_type`、来源题或来源资料 ID。
 - 对过短或规则评分偏低的回答，MVP 会插入一条针对薄弱维度的追问；追问保留原题来源字段，且不会递归追问。
 - 专业面系统题库当前为会计学方向，非会计用户且未上传可用资料时会收到页面提示，但仍可继续体验。
+- 面试题使用浏览器本地语音朗读，中文题选择中文语音、英语题选择英文语音，不消耗 DeepSeek 额度。浏览器阻止自动播放时可点击“播放题目”。
 
-统一的资料出题入口是 `services.generate_questions_from_materials()`。存在可用资料和 DeepSeek 配置时，系统使用 `deepseek-flash` 生成问题；API 未配置、超时、鉴权失败或 JSON 无效时自动使用本地规则。系统题库抽题不调用模型。
+统一的资料出题入口是 `services.generate_questions_from_materials()`。存在可用资料和 DeepSeek 配置时，每轮最多使用一次 `deepseek-flash` 深度生成问题，其余题继续按资料内容生成；院校真题直接抽取原题。API 未配置、超时、鉴权失败或 JSON 无效时自动使用本地规则。系统题库抽题不调用模型。
 
 ## 上传资料说明
 

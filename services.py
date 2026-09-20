@@ -340,6 +340,7 @@ def generate_questions_from_materials(
     ).fetchall()
     generated: list[dict[str, Any]] = []
     type_indices: Counter[str] = Counter()
+    ai_question_attempted = False
     for interview_type in requested_types:
         index = type_indices[interview_type]
         type_indices[interview_type] += 1
@@ -347,7 +348,9 @@ def generate_questions_from_materials(
         if material:
             generation_method = "rule"
             question_text = _material_question(material, interview_type, index)
-            if _ai_call_allowed(conn, visitor_id, session_id, "question_generation"):
+            should_use_ai = material["material_type"] != "院校面试真题" and not ai_question_attempted
+            if should_use_ai and _ai_call_allowed(conn, visitor_id, session_id, "question_generation"):
+                ai_question_attempted = True
                 try:
                     question_text = generate_interview_question(
                         interview_type=interview_type,

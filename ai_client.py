@@ -114,7 +114,7 @@ def complete_json(system_prompt: str, user_prompt: str, max_tokens: int = 1200) 
                 "temperature": 0.3,
                 "max_tokens": max_tokens,
             },
-            timeout=(8, 50),
+            timeout=(6, 30),
         )
     except requests.RequestException as exc:
         raise AIServiceError("DeepSeek 网络请求失败或超时。") from exc
@@ -176,7 +176,7 @@ def analyze_interview_answer(*, question_text: str, answer_text: str, interview_
             f"题型：{interview_type}\n题目：{question_text}\n用户回答：{answer_text}\n"
             "请严格按要求返回 JSON。"
         ),
-        max_tokens=1100,
+        max_tokens=700,
     )
     score_keys = ("logic_score", "completeness_score", "accuracy_score", "clarity_score", "response_score")
     scores: dict[str, float] = {}

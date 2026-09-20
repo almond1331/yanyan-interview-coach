@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import html
 import hashlib
 import logging
@@ -10,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 import services as services_module
 
 from ai_client import AIServiceError, provider_status, test_connection
@@ -36,7 +38,6 @@ from services import (
     finish_session,
     generate_session_questions,
     get_report,
-    get_session_questions,
     list_materials,
     list_questions,
     list_sessions,
@@ -492,9 +493,7 @@ def render_home() -> None:
     c3.metric("累计练习时长", f"{round(metrics['total_seconds'] / 60)} 分钟")
 
 
-def elapsed_label(session_id: int) -> str:
-    report = get_report(session_id, VISITOR_ID)
-    started = report["session"]["started_at"] if report else None
+def elapsed_label(started: str | None) -> str:
     if not started:
         return "00:00"
     try:
@@ -511,15 +510,72 @@ def render_chat(questions: list, current_index: int) -> None:
             f'<div class="chat-ai"><b>言言 · 面试官</b><br>{html.escape(question["question_text"])}<br><span class="source-badge">{html.escape(question["source_type"])} · {html.escape(question["generation_method"])}</span></div>',
             unsafe_allow_html=True,
         )
-        answer = get_report(question["session_id"], VISITOR_ID)["details"][index]["answer_text"]
+        answer = question["answer_text"]
         if answer:
             st.markdown(f'<div class="chat-user">{html.escape(answer)}</div>', unsafe_allow_html=True)
 
 
+def render_question_audio(question: Any, autoplay: bool) -> None:
+    encoded_question = base64.b64encode(question["question_text"].encode("utf-8")).decode("ascii")
+    language = "en-US" if question["interview_type"] == "英语面" else "zh-CN"
+    autoplay_script = "setTimeout(speakQuestion, 450);" if autoplay else ""
+    components.html(
+        f"""
+        <div class="audio-controls">
+          <button type="button" onclick="speakQuestion()" title="播放当前面试题">播放题目</button>
+          <button type="button" class="secondary" onclick="window.speechSynthesis.cancel()" title="停止朗读">停止</button>
+          <span id="status" aria-live="polite"></span>
+        </div>
+        <script>
+          const encodedQuestion = "{encoded_question}";
+          const questionText = new TextDecoder().decode(
+            Uint8Array.from(atob(encodedQuestion), char => char.charCodeAt(0))
+          );
+          const language = "{language}";
+          const status = document.getElementById("status");
+
+          function speakQuestion() {{
+            window.speechSynthesis.cancel();
+            const speech = new SpeechSynthesisUtterance(questionText);
+            speech.lang = language;
+            speech.rate = language === "en-US" ? 0.9 : 0.95;
+            speech.pitch = 1;
+            const voices = window.speechSynthesis.getVoices();
+            const exactVoice = voices.find(voice => voice.lang === language);
+            const languageVoice = voices.find(voice => voice.lang.startsWith(language.slice(0, 2)));
+            if (exactVoice || languageVoice) speech.voice = exactVoice || languageVoice;
+            speech.onstart = () => status.textContent = "正在朗读";
+            speech.onend = () => status.textContent = "朗读完成";
+            speech.onerror = () => status.textContent = "请点击播放题目";
+            window.speechSynthesis.speak(speech);
+          }}
+
+          {autoplay_script}
+        </script>
+        <style>
+          body {{ margin: 0; font-family: sans-serif; background: transparent; }}
+          .audio-controls {{ height: 48px; display: flex; align-items: center; justify-content: center; gap: 10px; }}
+          button {{ min-width: 108px; height: 40px; border: 0; border-radius: 7px; background: #2563eb; color: white; font-weight: 650; cursor: pointer; }}
+          button.secondary {{ min-width: 72px; background: white; color: #17365f; border: 1px solid #cbd5e1; }}
+          button:hover {{ filter: brightness(.96); }}
+          span {{ min-width: 72px; color: #64748b; font-size: 13px; }}
+        </style>
+        """,
+        height=54,
+    )
+
+
 def render_interview(session_id: int) -> None:
-    questions = get_session_questions(session_id, VISITOR_ID)
+    report = get_report(session_id, VISITOR_ID)
+    if not report:
+        st.error("未找到该场面试。")
+        return
+    questions = report["details"]
     index = min(st.session_state.current_question_index, max(0, len(questions) - 1))
-    st.markdown(f'<div class="recording"><span class="dot"></span>录制中　{elapsed_label(session_id)}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="recording"><span class="dot"></span>录制中　{elapsed_label(report["session"]["started_at"])}</div>',
+        unsafe_allow_html=True,
+    )
     top_left, top_right = st.columns([1, 5])
     with top_left:
         if st.button("返回选择", icon=":material/arrow_back:"):
@@ -539,6 +595,11 @@ def render_interview(session_id: int) -> None:
             '<div class="interview-shell"><div class="wave"><i></i><i></i><i></i><i></i><i></i></div><h3>言言正在聆听</h3><p class="subtle">请在下方完整输入你的回答，页面默认不直接展示题目</p></div>',
             unsafe_allow_html=True,
         )
+        question_id = questions[index]["session_question_id"]
+        autoplay = st.session_state.get("last_audio_question_id") != question_id
+        st.session_state.last_audio_question_id = question_id
+        render_question_audio(questions[index], autoplay)
+        st.caption("浏览器若阻止首次自动朗读，请点击“播放题目”。声音由本机浏览器生成，不消耗 AI 额度。")
         answer_key = f"answer_{session_id}_{questions[index]['session_question_id']}"
         st.text_area(
             "输入你的回答",
@@ -590,7 +651,6 @@ def render_interview(session_id: int) -> None:
                     st.toast("本轮题目已全部完成")
                 st.rerun()
         with end_col:
-            report = get_report(session_id, VISITOR_ID)
             if st.button(
                 "结束并查看报告",
                 use_container_width=True,

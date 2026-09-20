@@ -138,6 +138,43 @@ class YanyanMvpTests(unittest.TestCase):
         self.assertEqual("deepseek", rows[0]["generation_method"])
         self.assertIn("消融实验", rows[0]["question_text"])
 
+    def test_material_question_generation_uses_ai_once_per_session(self) -> None:
+        session_id = services.create_session(self.VISITOR_A, "科研面", "人工智能", {"科研面": 3}, "")
+        services.save_material(
+            visitor_id=self.VISITOR_A,
+            session_id=session_id,
+            material_type="简历",
+            file_name="简历.txt",
+            data="医学影像分割项目\n模型消融实验\n数据清洗与质量控制".encode("utf-8"),
+        )
+        with (
+            patch.object(services, "provider_status", return_value=(True, "DeepSeek 已配置")),
+            patch.object(services, "generate_interview_question", return_value="请介绍项目贡献与验证方法？") as generate,
+        ):
+            rows = services.generate_session_questions(session_id, self.VISITOR_A)
+
+        self.assertEqual(1, generate.call_count)
+        self.assertEqual(1, sum(row["generation_method"] == "deepseek" for row in rows))
+        self.assertEqual(2, sum(row["generation_method"] == "rule" for row in rows))
+
+    def test_school_exam_questions_do_not_call_ai(self) -> None:
+        session_id = services.create_session(self.VISITOR_A, "科研面", "人工智能", {"科研面": 2}, "")
+        services.save_material(
+            visitor_id=self.VISITOR_A,
+            session_id=session_id,
+            material_type="院校面试真题",
+            file_name="真题.txt",
+            data="请介绍你的研究计划？\n为什么选择我们学校？".encode("utf-8"),
+        )
+        with (
+            patch.object(services, "provider_status", return_value=(True, "DeepSeek 已配置")),
+            patch.object(services, "generate_interview_question") as generate,
+        ):
+            rows = services.generate_session_questions(session_id, self.VISITOR_A)
+
+        generate.assert_not_called()
+        self.assertTrue(all(row["generation_method"] == "rule" for row in rows))
+
     def test_deepseek_answer_evaluation_is_saved(self) -> None:
         session_id = services.create_session(self.VISITOR_A, "科研面", "人工智能", {"科研面": 1}, "")
         question = services.generate_session_questions(session_id, self.VISITOR_A)[0]
