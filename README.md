@@ -12,7 +12,7 @@
 ├─ ai_client.py            # DeepSeek API、JSON 校验、超时和错误处理
 ├─ db.py                   # Supabase/SQLite 连接、初始化、示例数据与埋点
 ├─ services.py             # 出题优先级、资料解析、评分、报告服务
-├─ schema.sql              # 六张核心表、约束与索引
+├─ schema.sql              # 七张业务表、约束与索引
 ├─ schema_postgres.sql     # Supabase Postgres 表结构、索引与 RLS
 ├─ queries.sql             # 历史、来源、维度、漏斗等分析 SQL
 ├─ requirements.txt
@@ -58,7 +58,7 @@ python -m streamlit run app.py
 
 无需手工执行 SQL。`app.py` 启动时会调用 `init_db()`：
 
-1. 执行 `schema.sql` 创建 `questions`、`interview_sessions`、`session_questions`、`answers`、`materials`、`event_logs`。
+1. 执行 `schema.sql` 创建 `questions`、`interview_sessions`、`session_questions`、`answers`、`materials`、`event_logs`、`session_feedback`。
 2. 当系统题库为空时，自动写入四类各 5 道示例题。
 3. SQLite 文件默认位于 `data/yanyan.db`。
 
@@ -76,10 +76,11 @@ python -m streamlit run app.py
 - 公开版不显示全站数据看板，也不显示会消耗额度的 AI 连接测试。只有设置 `APP_ENV = "development"` 时才显示连接测试。
 - 侧边栏“隐私与数据”可以清除当前匿名访客的会话、回答、资料和产品埋点。为防止绕过当日全站成本上限，系统只保留不含回答、资料和访客编号的匿名 AI 调用计数。
 - 资料片段和回答会发送给 DeepSeek。请勿上传身份证、电话、住址等无关敏感信息。
+- 报告页支持提交“报告有用度、题目贴合度和改进建议”，同一场面试重复提交会更新原反馈。
 
 配置 Supabase Secrets 后，Streamlit Cloud 使用 Supabase Postgres 持久化数据；未配置时自动使用本地 SQLite，便于本地开发和自动测试。首次切换到 Supabase 后，原 Streamlit 临时 SQLite 中的历史不会自动迁移，后续新数据会持久保存。
 
-Supabase 使用 Transaction pooler（通常为端口 6543）和 SSL 连接。代码关闭服务端预编译语句以兼容事务连接池，并为六张表启用 RLS；应用通过仅存放在 Streamlit Secrets 中的数据库账号访问，浏览器不会拿到数据库凭据。
+Supabase 使用 Transaction pooler（通常为端口 6543）和 SSL 连接。代码关闭服务端预编译语句以兼容事务连接池，并为七张表启用 RLS；应用通过仅存放在 Streamlit Secrets 中的数据库账号访问，浏览器不会拿到数据库凭据。
 
 Streamlit Cloud 的 Secrets 需要包含：
 
@@ -138,4 +139,4 @@ py -m unittest discover -s tests -v
 
 ## SQL 与 BI
 
-`queries.sql` 提供七组分析查询：历史会话、题目来源占比、各题型维度分、高频薄弱项、核心漏斗、资料使用次数和每日 AI 成本事件。公开应用不展示全站数据看板，避免匿名访客看到其他人的聚合数据与埋点。
+`queries.sql` 提供八组分析查询：历史会话、题目来源占比、各题型维度分、高频薄弱项、核心漏斗、资料使用次数、每日 AI 成本事件和报告反馈。公开应用不展示全站数据看板，避免匿名访客看到其他人的聚合数据与埋点。

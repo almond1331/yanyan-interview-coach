@@ -32,6 +32,7 @@ DIMENSION_LABELS = {
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_EXTRACTED_DOCUMENT_BYTES = 10 * 1024 * 1024
 MAX_ANSWER_CHARS = 3000
+MAX_FEEDBACK_CHARS = 500
 MAX_FILES_PER_CONFIG = 3
 MAX_MATERIALS_PER_VISITOR = 20
 DAILY_SESSION_LIMIT = 3
@@ -752,6 +753,54 @@ def get_report(session_id: int, visitor_id: str) -> dict[str, Any] | None:
         (session_id,),
     )
     return {"session": session, "summary": summary, "details": details, "weaknesses": weak_rows}
+
+
+def get_session_feedback(session_id: int, visitor_id: str) -> Any | None:
+    return fetch_one(
+        """
+        SELECT f.* FROM session_feedback f
+        JOIN interview_sessions s ON s.session_id=f.session_id
+        WHERE f.session_id=? AND s.visitor_id=?
+        """,
+        (session_id, visitor_id),
+    )
+
+
+def save_session_feedback(
+    session_id: int,
+    visitor_id: str,
+    helpful_score: int,
+    relevance_score: int,
+    comment: str = "",
+) -> None:
+    if helpful_score not in range(1, 6) or relevance_score not in range(1, 6):
+        raise ValueError("反馈评分必须为 1 到 5 分")
+    cleaned_comment = comment.strip()
+    if len(cleaned_comment) > MAX_FEEDBACK_CHARS:
+        raise ValueError("反馈建议不能超过 500 字")
+    with transaction() as conn:
+        session = _owned_session(conn, session_id, visitor_id)
+        if session["status"] != "completed":
+            raise ValueError("完成面试后才能提交反馈")
+        conn.execute(
+            """
+            INSERT INTO session_feedback(session_id, helpful_score, relevance_score, comment)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                helpful_score=excluded.helpful_score,
+                relevance_score=excluded.relevance_score,
+                comment=excluded.comment,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (session_id, helpful_score, relevance_score, cleaned_comment),
+        )
+    log_event(
+        "report_feedback_submitted",
+        visitor_id,
+        session_id,
+        "面试报告",
+        {"helpful_score": helpful_score, "relevance_score": relevance_score},
+    )
 
 
 def list_sessions(visitor_id: str) -> list[Any]:

@@ -83,6 +83,28 @@ class YanyanMvpTests(unittest.TestCase):
         self.assertEqual(1, report["summary"]["answered_questions"])
         self.assertEqual("completed", report["session"]["status"])
 
+    def test_report_feedback_is_owned_validated_and_updated(self) -> None:
+        session_id = services.create_session(self.VISITOR_A, "科研面", "人工智能", {"科研面": 1}, "")
+        services.generate_session_questions(session_id, self.VISITOR_A)
+        with self.assertRaisesRegex(ValueError, "完成面试"):
+            services.save_session_feedback(session_id, self.VISITOR_A, 4, 4, "尚未完成")
+
+        services.finish_session(session_id, self.VISITOR_A)
+        with self.assertRaisesRegex(ValueError, "1 到 5"):
+            services.save_session_feedback(session_id, self.VISITOR_A, 0, 4, "")
+        with self.assertRaises(ValueError):
+            services.save_session_feedback(session_id, self.VISITOR_B, 4, 4, "越权反馈")
+
+        services.save_session_feedback(session_id, self.VISITOR_A, 4, 3, "希望建议更具体")
+        services.save_session_feedback(session_id, self.VISITOR_A, 5, 4, "修改后的反馈")
+        feedback = services.get_session_feedback(session_id, self.VISITOR_A)
+        self.assertEqual(5, feedback["helpful_score"])
+        self.assertEqual(4, feedback["relevance_score"])
+        self.assertEqual("修改后的反馈", feedback["comment"])
+        self.assertIsNone(services.get_session_feedback(session_id, self.VISITOR_B))
+        count = db.fetch_one("SELECT COUNT(*) AS count FROM session_feedback")["count"]
+        self.assertEqual(1, count)
+
     def test_short_answer_creates_one_followup(self) -> None:
         session_id = services.create_session(self.VISITOR_A, "科研面", "人工智能", {"科研面": 1}, "")
         question = services.generate_session_questions(session_id, self.VISITOR_A)[0]
@@ -267,11 +289,14 @@ class YanyanMvpTests(unittest.TestCase):
             )
 
     def test_clear_data_only_removes_current_visitor(self) -> None:
-        services.create_session(self.VISITOR_A, "行为面", "通用", {"行为面": 1}, "")
+        session_a = services.create_session(self.VISITOR_A, "行为面", "通用", {"行为面": 1}, "")
         services.create_session(self.VISITOR_B, "行为面", "通用", {"行为面": 1}, "")
+        services.finish_session(session_a, self.VISITOR_A)
+        services.save_session_feedback(session_a, self.VISITOR_A, 5, 5, "有帮助")
         services.clear_visitor_data(self.VISITOR_A)
         self.assertEqual([], services.list_sessions(self.VISITOR_A))
         self.assertEqual(1, len(services.list_sessions(self.VISITOR_B)))
+        self.assertEqual(0, db.fetch_one("SELECT COUNT(*) AS count FROM session_feedback")["count"])
 
     def test_clear_data_anonymizes_but_retains_global_ai_budget(self) -> None:
         session_id = services.create_session(self.VISITOR_A, "行为面", "通用", {"行为面": 1}, "")
@@ -358,6 +383,7 @@ class YanyanMvpTests(unittest.TestCase):
             "materials",
             "session_questions",
             "answers",
+            "session_feedback",
             "event_logs",
         ):
             self.assertIn(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY", schema)

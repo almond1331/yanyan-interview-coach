@@ -85,6 +85,17 @@ CREATE TABLE IF NOT EXISTS answers (
     FOREIGN KEY (session_id) REFERENCES interview_sessions(session_id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS session_feedback (
+    feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL UNIQUE,
+    helpful_score INTEGER NOT NULL CHECK (helpful_score BETWEEN 1 AND 5),
+    relevance_score INTEGER NOT NULL CHECK (relevance_score BETWEEN 1 AND 5),
+    comment TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES interview_sessions(session_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS event_logs (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER,
@@ -100,5 +111,6 @@ CREATE INDEX IF NOT EXISTS idx_questions_type ON questions(interview_type, is_ac
 CREATE INDEX IF NOT EXISTS idx_sessions_created ON interview_sessions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_session_questions_session ON session_questions(session_id, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_answers_session ON answers(session_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_created ON session_feedback(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_materials_type ON materials(material_type, session_id);
 CREATE INDEX IF NOT EXISTS idx_events_name_time ON event_logs(event_name, created_at);

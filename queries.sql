@@ -57,3 +57,13 @@ FROM event_logs
 WHERE event_name IN ('ai_request_reserved', 'ai_limit_reached', 'ai_fallback_used')
 GROUP BY DATE(created_at)
 ORDER BY usage_date DESC;
+
+-- 8. 报告反馈：有用度、题目贴合度和文字建议量
+SELECT DATE(f.created_at) AS feedback_date,
+       COUNT(*) AS feedback_count,
+       ROUND(AVG(f.helpful_score), 2) AS avg_helpful_score,
+       ROUND(AVG(f.relevance_score), 2) AS avg_relevance_score,
+       SUM(CASE WHEN f.comment <> '' THEN 1 ELSE 0 END) AS comment_count
+FROM session_feedback f
+GROUP BY DATE(f.created_at)
+ORDER BY feedback_date DESC;
