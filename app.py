@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import logging
 import os
 import re
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 import streamlit as st
 import services as services_module
@@ -52,13 +54,21 @@ st.set_page_config(page_title="言言陪练", page_icon="言", layout="wide", in
 
 
 @st.cache_resource
-def initialize_database() -> str:
+def initialize_database(schema_fingerprint: str) -> str:
+    del schema_fingerprint
     init_db()
     return database_backend()
 
 
+def database_schema_fingerprint() -> str:
+    digest = hashlib.sha256()
+    for file_name in ("schema.sql", "schema_postgres.sql"):
+        digest.update((Path(__file__).resolve().parent / file_name).read_bytes())
+    return digest.hexdigest()
+
+
 try:
-    DATABASE_BACKEND = initialize_database()
+    DATABASE_BACKEND = initialize_database(database_schema_fingerprint())
 except RuntimeError as exc:
     st.error(f"数据库配置错误：{exc}")
     st.info("请检查 Streamlit Cloud 的 Supabase Secrets 是否完整，并确认使用 Transaction pooler 参数。")
@@ -659,7 +669,12 @@ def render_report_feedback(session_id: int) -> None:
         return
 
     st.subheader("体验反馈")
-    saved_feedback = get_feedback(session_id, VISITOR_ID)
+    try:
+        saved_feedback = get_feedback(session_id, VISITOR_ID)
+    except Exception:
+        LOGGER.exception("Report feedback table is not ready")
+        st.info("反馈功能正在完成更新，请稍后刷新报告页。")
+        return
     if saved_feedback:
         st.caption("你已提交过反馈，可以修改后再次保存。")
     helpful_default = int(saved_feedback["helpful_score"]) if saved_feedback else 4
@@ -691,6 +706,9 @@ def render_report_feedback(session_id: int) -> None:
                 st.success("反馈已保存，感谢你的建议。")
             except ValueError as exc:
                 st.error(str(exc))
+            except Exception:
+                LOGGER.exception("Saving report feedback failed")
+                st.error("反馈暂时无法保存，请稍后重试；面试报告不受影响。")
 
 
 def render_history() -> None:
